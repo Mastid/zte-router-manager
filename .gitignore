@@ -35,3 +35,6 @@ android-build/diag/*.log
 *.log
 .DS_Store
 Thumbs.db
+
+# --- 自动发布凭据（本机自用，禁止入库）---
+android-build/.github_token
