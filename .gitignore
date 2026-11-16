@@ -1,0 +1,37 @@
+# --- 构建产物 / 工具链 ---
+android-build/sdk/
+android-build/jdk-17.0.2/
+android-build/jdk17.zip
+android-build/cmdline-tools.zip
+android-build/out/
+android-build/*.apk
+android-build/*.apk.idsig
+android-build/*.apk.idsig
+android-build/debug.keystore
+android-build/test-result.txt
+android-build/sources.txt
+android-build/classes.txt
+
+# --- 面板运行产物 ---
+zte-router-lab/logs/
+zte-router-lab/__pycache__/
+zte-router-lab/bin/
+zte-router-lab/token_mode.txt
+
+# --- 历史备份（旧版本快照） ---
+zte-router-lab/*.keep-*
+zte-router-lab/*.before-*
+android-build/*.before-*
+android-build/diag/*.class
+
+# --- 测试输出 ---
+android-build/diag/node_modules/
+android-build/diag/out/
+android-build/diag/*.log
+
+# --- 工作区 ---
+.workbuddy/
+.tmpchk*/
+*.log
+.DS_Store
+Thumbs.db

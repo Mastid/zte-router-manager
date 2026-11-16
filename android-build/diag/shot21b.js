@@ -1,0 +1,25 @@
+const { chromium } = require('playwright');
+const path = require('path');
+const PREVIEW = 'file:///C:/Users/Administrator/WorkBuddy/2026-11-14-19-52-51/android-build/out/preview.html';
+const EXE = 'C:/Users/Administrator/AppData/Local/ms-playwright/chromium-1134/chrome-win/chrome.exe';
+const OUT = path.resolve(__dirname, '../out/shots21');
+(async () => {
+  const browser = await chromium.launch({ executablePath: EXE });
+  const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, deviceScaleFactor: 2 });
+  const page = await ctx.newPage();
+  const errs = [];
+  page.on('pageerror', (e) => errs.push('PAGEERROR ' + e.message));
+  await page.goto(PREVIEW, { waitUntil: 'load' });
+  await page.waitForTimeout(300);
+  await page.evaluate(async () => { show('main'); await load(); document.querySelector('[data-tab="dev"]').click(); });
+  await page.waitForTimeout(900);
+  await (await page.$('#pgDev')).screenshot({ path: path.join(OUT, '01-devs.png') });
+  await page.evaluate(() => document.documentElement.dataset.theme = 'dark');
+  await page.waitForTimeout(300);
+  await (await page.$('#pgDev')).screenshot({ path: path.join(OUT, '02-devs-dark.png') });
+  await page.evaluate(() => { document.documentElement.dataset.theme = 'light'; openDev('A4:83:E7:1B:22:90'); });
+  await page.waitForTimeout(700);
+  await (await page.$('#devSheet .sheet')).screenshot({ path: path.join(OUT, '03-dev-detail.png') });
+  console.log(errs.length ? errs.join('\n') : '无 JS 报错');
+  await browser.close();
+})();
