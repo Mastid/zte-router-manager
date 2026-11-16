@@ -278,8 +278,8 @@ def _api_dualwan_local(ports, by_idx):
     return {
         "ok": True,
         "supported": True,
-        "flavor": "fixed",          # 前端据此画「固定口」形态，不给选口
-        "canSwitch": False,          # 写入口径还没验证过，先只读，避免把宽带配置打坏
+        "flavor": "fixed",          # 前端据此画「固定口」形态，只给 WAN2 开关，不给选口
+        "canSwitch": True,           # 支持开关 WAN2（回填式写入，见 _api_dualwan_set_local）
         "wan1": {
             "idx": w1_idx,
             "name": (w1 or {}).get("name", "WAN"),
@@ -314,7 +314,7 @@ def _api_dualwan_local(ports, by_idx):
             "isMain": p is w1,
             "isSec": p is w2,
         } for i, p in by_idx.items()],
-        "note": "这台机器的物理 WAN 只有一个（WAN1），WAN2 是把 WAN1 旁边那个网口切过去当第二个 WAN 用。",
+        "note": "这台机器的物理 WAN 只有一个（WAN1），WAN2 是把 WAN1 旁边那个网口切过去当第二个 WAN 用。可以直接在这里开关 WAN2。",
     }
 
 
@@ -414,6 +414,106 @@ def _resolve_port(raw, by_idx, what="网口"):
     return i
 
 
+def _local_w2_name(ports, by_idx):
+    """本机口径 WAN2 的口名：优先固件已标成 WAN2（wanType=2）的口，否则就是 WAN1 旁边的 LAN1"""
+    for i, p in by_idx.items():
+        if _str(p.get("wanType")) == "2":
+            return _str(p.get("name"))
+    for i, p in by_idx.items():
+        if _str(p.get("name")).upper() == "LAN1":
+            return _str(p.get("name"))
+    return "LAN1"
+
+
+def _api_dualwan_set_local(body=None, ports=None, by_idx=None):
+    """本机口径：WAN1 口固定，只能开启/关闭 WAN2（回填式写入）。
+
+    固件写通道（逆向自 app.c6761c8.js 的 postRequestFunc）：
+    POST vue_dualwan_data，IF_ACTION=Apply + _InstID。
+    把读到的 ID_WAN_COMFIG 关键字段原样回填，只改 Enable，
+    不凭空构造字段，避免打坏宽带配置。
+    """
+    body = body or {}
+    enable = body.get("enable")
+    if enable is None:
+        raise ValueError("这台机器的 WAN1/WAN2 口是固定的：WAN1 用机身 WAN 口，"
+                         "WAN2 用它旁边那个网口；这里只能开启/关闭 WAN2")
+    want = _str(enable).lower() in ("1", "true", "on", "yes", "启用", "开")
+    dw = _wan2_state()
+    if not dw:
+        raise ValueError("读不到 WAN2 配置（需要先登录路由器后台），刷新后重试")
+    inst_id = _str(dw.get("_InstID"))
+    if not inst_id:
+        raise ValueError("读不到 WAN2 配置实例（_InstID），刷新后重试")
+    enabled = _str(dw.get("Enable")) == "1"
+    if want == enabled:
+        return {"ok": True, "changed": False, "enabled": enabled,
+                "msg": "WAN2 已经是「%s」状态" % ("启用" if enabled else "关闭")}
+
+    wct, mode, wname = _type_of(dw)
+    payload = {
+        "IF_ACTION": "Apply",
+        "Enable": "1" if want else "0",
+        "_InstID": inst_id,
+        "WANC_TYPE": wct,
+        "WANCName": wname,
+        "mode": mode,
+        "TypeFlag": "0",
+    }
+    if want:
+        # 开启时按模式回填：PPPoE 必须带账号密码，读不到绝不硬提交
+        if wct == "pppoe":
+            user = _str(dw.get("UserName"))
+            pwd = ""
+            try:
+                txt = _f("_raw_get", "/?_type=vueData&_tag=vue_dualwan_data&IF_OP=GetPassword"
+                                    "&_InstID_PASS=%s&PASSTYPE=PPP&_=%d"
+                                    % (inst_id, _now_ms()))
+                pwd = _str((_f("_insts", txt, "OBJ_ETHWANCPPP_ID") or [{}])[0].get("Password"))
+            except Exception:
+                pwd = ""
+            if not user or not pwd:
+                raise ValueError("WAN2 是 PPPoE 拨号，路由器没有交出宽带密码；"
+                                 "为避免打坏账号，请到原版管理页操作开启")
+            r, l = _f("rand16"), _f("rand16")
+            payload.update({
+                "UserName": user,
+                "Password": _f("enc_para", pwd, r, l),
+                "PPPoEServiceName": _str(dw.get("PPPoEServiceName")),
+                "encode": _f("enc_key", r, l),
+            })
+        elif mode == "Static":
+            payload.update({
+                "IPAddress": _str(dw.get("IPAddress")),
+                "SubnetMask": _str(dw.get("SubnetMask")),
+                "GateWay": _str(dw.get("GateWay")),
+                "Addressingtype": "Static",
+                "DNS1": _str(dw.get("DNS1")) or "0.0.0.0",
+                "DNS2": _str(dw.get("DNS2")) or "0.0.0.0",
+            })
+        elif mode == "DHCP":
+            payload["DNSOverrideAllowedv4"] = "0" if _str(dw.get("DNSOverrideAllowedv4")) == "0" else "1"
+
+    st, txt = _f("req", DW_URL % _now_ms(), payload, timeout=20)
+    err = _set_error(txt)
+    if st != 200 or err:
+        raise RuntimeError("路由器拒绝了这次修改（%s）" % (err or ("HTTP %s" % st)))
+
+    # 复查：Enable 真的变成目标状态才算成功
+    try:
+        after = _wan2_state()
+        now_on = _str(after.get("Enable")) == "1"
+    except Exception:
+        now_on = not want
+    if now_on != want:
+        raise RuntimeError("路由器没有接受这次切换（WAN2 仍为%s）。"
+                           "这台固件可能要求在原版管理页里改。"
+                           % ("启用" if now_on else "关闭"))
+    w2name = _local_w2_name(ports or [], by_idx or {})
+    return {"ok": True, "changed": True, "enabled": want,
+            "msg": "WAN2 已%s（%s 口）" % ("开启" if want else "关闭", w2name)}
+
+
 def api_dualwan_set(body=None):
     """两个物理 WAN 口设置：可同时指定 WAN1（WANSelect）与 WAN2（SecWanLink）。
 
@@ -438,9 +538,8 @@ def api_dualwan_set(body=None):
     cfg = _dual_cfg()
     basic, wanlan, lb, mal = cfg["basic"], cfg["wanlan"], cfg["lb"], cfg["mal"]
     if not basic:
-        # 本机口径：WAN2 = WAN1 旁边那个口，没有「换到别的口」这回事
-        raise ValueError("这台机器的物理 WAN 只有一个（WAN1），WAN2 是把 WAN1 旁边那个网口切过去用，"
-                         "不能在别的口之间挑。请到路由器原版管理页的「双 WAN」里开启/关闭。")
+        # 本机口径：WAN1 口固定，WAN2 = WAN1 旁边那个口；只能开关 WAN2
+        return _api_dualwan_set_local(body, ports, by_idx)
     dw = _wan2_state()
     if not dw:
         raise ValueError("读不到 WAN2 配置，先刷新一下再试")

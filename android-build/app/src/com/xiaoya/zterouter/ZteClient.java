@@ -3673,7 +3673,7 @@ public class ZteClient {
     /**
      * 本机口径的双 WAN：物理只有一个 WAN 口，
      * WAN2 = WAN1 旁边那个网口（固件文案「WAN2（LAN1）」），启用后该口 WanType 变 2。
-     * 这里只读展示，不改配置（写入口径还没验证，避免把宽带配置打坏）。
+     * 写入走 dualwanFixedSetJson（回填式开关 WAN2）。
      */
     private String dualwanFixedJson() {
         List<Map<String, String>> ports;
@@ -3726,7 +3726,7 @@ public class ZteClient {
         Map<String, String> p1 = i1 >= 0 ? ports.get(i1) : new LinkedHashMap<String, String>();
         Map<String, String> p2 = i2 >= 0 ? ports.get(i2) : new LinkedHashMap<String, String>();
         String status = enabled ? pick(nz(str(dw.get("ConnStatus"))), "已启用") : "未启用";
-        return "{\"ok\":true,\"supported\":true,\"flavor\":\"fixed\",\"canSwitch\":false"
+        return "{\"ok\":true,\"supported\":true,\"flavor\":\"fixed\",\"canSwitch\":true"
                 + ",\"wan1\":{\"idx\":" + i1 + ",\"name\":" + jstr(pick(nz(p1.get("name")), "WAN"))
                 + ",\"link\":" + ("1".equals(p1.get("link")) ? "true" : "false")
                 + ",\"speed\":" + jstr(nz(p1.get("speed")))
@@ -3744,7 +3744,101 @@ public class ZteClient {
                 + ",\"ip\":" + jstr(nz(str(dw.get("IPAddress")))) + "}"
                 + ",\"loadBalance\":{\"enabled\":false,\"wan1\":\"1\",\"wan2\":\"1\"}"
                 + ",\"failover\":false,\"ports\":" + ps
-                + ",\"note\":\"这台机器的物理 WAN 只有一个（WAN1），WAN2 是把 WAN1 旁边那个网口切过去当第二个 WAN 用。\"}";
+                + ",\"note\":\"这台机器的物理 WAN 只有一个（WAN1），WAN2 是把 WAN1 旁边那个网口切过去当第二个 WAN 用。可以直接在这里开关 WAN2。\"}";
+    }
+
+    /**
+     * 本机口径：WAN1 口固定，只能开启/关闭 WAN2（回填式写入）。
+     * 读 vue_dualwan_data 的 ID_WAN_COMFIG，只改 Enable，其余关键字段原样回填，
+     * POST IF_ACTION=Apply + _InstID；PPPoE 开启时读不到宽带密码绝不硬提交。
+     */
+    private String dualwanFixedSetJson(String arg) {
+        String en = argStr(arg, "enable");
+        if (en.length() == 0) {
+            return "{\"ok\":false,\"logged\":true,\"error\":\"这台机器的 WAN1/WAN2 口是固定的："
+                    + "WAN1 用机身 WAN 口，WAN2 用它旁边那个网口；这里只能开启/关闭 WAN2\"}";
+        }
+        boolean want = "1".equals(en) || "true".equalsIgnoreCase(en) || "on".equalsIgnoreCase(en);
+        try {
+            Resp r2 = req("/?_type=vueData&_tag=vue_dualwan_data&_=" + System.currentTimeMillis(), null, 10);
+            Map<String, String> dw = firstTag(r2.body == null ? "" : r2.body, "ID_WAN_COMFIG");
+            String instId = dw == null ? "" : nz(str(dw.get("_InstID")));
+            if (dw == null || dw.isEmpty() || instId.length() == 0) {
+                return "{\"ok\":false,\"logged\":true,\"error\":\"读不到 WAN2 配置（需要先登录路由器后台），刷新后重试\"}";
+            }
+            boolean enabled = "1".equals(str(dw.get("Enable")));
+            if (want == enabled) {
+                return "{\"ok\":true,\"changed\":false,\"enabled\":" + (enabled ? "true" : "false")
+                        + ",\"msg\":\"WAN2 已经是「" + (enabled ? "启用" : "关闭") + "」状态\",\"logged\":true}";
+            }
+            String wct = "dhcp/static", mode = "DHCP", wname = "DHCP_2";
+            String wanctype = nz(str(dw.get("WANCTYPE"))).toLowerCase();
+            String tt = nz(str(dw.get("TransType"))).toLowerCase();
+            String at = nz(str(dw.get("Addressingtype"))).toLowerCase();
+            if ("bridge".equals(wanctype)) { wct = "bridge"; mode = "bridge"; wname = "Bridge_2"; }
+            else if (tt.contains("pppoe")) { wct = "pppoe"; mode = "pppoe"; wname = "PPPoE_2"; }
+            else if (at.contains("static") || tt.contains("static")) { wct = "dhcp/static"; mode = "Static"; wname = "Static_2"; }
+
+            LinkedHashMap<String, String> f = new LinkedHashMap<String, String>();
+            f.put("IF_ACTION", "Apply");
+            f.put("Enable", want ? "1" : "0");
+            f.put("_InstID", instId);
+            f.put("WANC_TYPE", wct);
+            f.put("WANCName", wname);
+            f.put("mode", mode);
+            f.put("TypeFlag", "0");
+            if (want) {
+                // 开启时按模式回填：PPPoE 必须带账号密码，读不到绝不硬提交
+                if ("pppoe".equals(wct)) {
+                    String user = nz(str(dw.get("UserName")));
+                    String pwd = "";
+                    try {
+                        Resp pr = req("/?_type=vueData&_tag=vue_dualwan_data&IF_OP=GetPassword&_InstID_PASS="
+                                + instId + "&PASSTYPE=PPP&_=" + System.currentTimeMillis(), null, 10);
+                        pwd = nz(str(firstTag(pr.body == null ? "" : pr.body, "OBJ_ETHWANCPPP_ID").get("Password")));
+                    } catch (Exception ignore) { }
+                    if (user.isEmpty() || pwd.isEmpty()) {
+                        return "{\"ok\":false,\"logged\":true,\"error\":\"WAN2 是 PPPoE 拨号，路由器没有交出宽带密码；"
+                                + "为避免打坏账号，请到原版管理页操作开启\"}";
+                    }
+                    String a = rand16(), b = rand16();
+                    f.put("UserName", user);
+                    f.put("Password", encPara(pwd, a, b));
+                    f.put("PPPoEServiceName", nz(str(dw.get("PPPoEServiceName"))));
+                    f.put("encode", encKey(a, b));
+                } else if ("Static".equals(mode)) {
+                    f.put("IPAddress", nz(str(dw.get("IPAddress"))));
+                    f.put("SubnetMask", nz(str(dw.get("SubnetMask"))));
+                    f.put("GateWay", nz(str(dw.get("GateWay"))));
+                    f.put("Addressingtype", "Static");
+                    f.put("DNS1", pick(nz(str(dw.get("DNS1"))), "0.0.0.0"));
+                    f.put("DNS2", pick(nz(str(dw.get("DNS2"))), "0.0.0.0"));
+                } else if ("DHCP".equals(mode)) {
+                    f.put("DNSOverrideAllowedv4", "0".equals(str(dw.get("DNSOverrideAllowedv4"))) ? "0" : "1");
+                }
+            }
+            Resp r = req("/?_type=vueData&_tag=vue_dualwan_data&_=" + System.currentTimeMillis(), f, 20);
+            String err = respErr(r.body);
+            if (r.status != 200 || err.length() > 0) {
+                return "{\"ok\":false,\"logged\":true,\"error\":\"路由器拒绝了这次修改（"
+                        + (err.length() > 0 ? err : ("HTTP " + r.status)) + "）\"}";
+            }
+            // 复查：Enable 真的变成目标状态才算成功
+            boolean nowOn = !want;
+            try {
+                Resp chk = req("/?_type=vueData&_tag=vue_dualwan_data&_=" + System.currentTimeMillis(), null, 10);
+                Map<String, String> cd = firstTag(chk.body == null ? "" : chk.body, "ID_WAN_COMFIG");
+                nowOn = "1".equals(str(cd.get("Enable")));
+            } catch (Exception ignore) { }
+            if (nowOn != want) {
+                return "{\"ok\":false,\"logged\":true,\"error\":\"路由器没有接受这次切换（WAN2 仍为"
+                        + (nowOn ? "启用" : "关闭") + "）。这台固件可能要求在原版管理页里改。\"}";
+            }
+            return "{\"ok\":true,\"changed\":true,\"enabled\":" + want
+                    + ",\"msg\":\"WAN2 已" + (want ? "开启" : "关闭") + "\",\"logged\":true}";
+        } catch (Exception e) {
+            return "{\"ok\":false,\"logged\":true,\"error\":" + jstr(msg(e)) + "}";
+        }
     }
 
     /** 把某个 LAN 口切成 WAN2：整表回填，只改 SecWanLink */
@@ -3752,7 +3846,8 @@ public class ZteClient {
         try {
             Resp dwchk = req("/?_type=hiddenData&_tag=vue_internet_eth_data&_=" + System.currentTimeMillis(), null, 10);
             if (dwchk.status != 200 || dwchk.body == null || dwchk.body.indexOf("OBJ_DUALWAN_BASIC_ID") < 0) {
-                return "{\"ok\":false,\"error\":\"这台机器的物理 WAN 只有一个（WAN1），WAN2 是把 WAN1 旁边那个网口切过去用，不能在口之间挑；请到路由器原版管理页的「双 WAN」里设置\"}";
+                // 本机（BE5100 Pro+ 这类）没有老款的双 WAN 表：WAN1 口固定，只能开关 WAN2
+                return dualwanFixedSetJson(arg);
             }
             List<Map<String, String>> ports = portList();
             // 两个物理 WAN 口设置：main=WAN1 口，sec/port/idx=WAN2 口，可以只给其中一个

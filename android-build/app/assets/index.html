@@ -3219,7 +3219,7 @@ function dwSlots(show) {
   if (tip) tip.classList.toggle('hidden', !show);
 }
 
-// 本机形态：「WAN1 固定 + WAN2 就是 WAN1 旁边那个网口」，没有选口，只展示两个口
+// 本机形态：「WAN1 固定 + WAN2 就是 WAN1 旁边那个网口」，没有选口，只有 WAN2 开关
 function renderDualWanFixed(d) {
   DW = d;
   dwSlots(false);                       // 固定形态没有选口区，也没有「应用端口设置」
@@ -3242,13 +3242,42 @@ function renderDualWanFixed(d) {
           ? '已切成第二个 WAN' + (w2.ip ? ' · ' + esc(w2.ip) : '')
           : '把这个网口切成第二个 WAN，接第二条宽带'}</div></div>
       <div class="dwr">${w2.enabled ? esc(w2.status || '已启用') : '未启用 · ' + link(w2)}</div>
-    </div>`;
+    </div>
+    <button class="btn2 pri" id="btnDwToggle" style="width:100%;margin-top:12px">${w2.enabled ? '关闭 WAN2' : '启用 WAN2'}</button>`;
+  const tg = $('#btnDwToggle');
+  if (tg) tg.onclick = () => toggleWan2Fixed(!w2.enabled);
   const tip = $('#dwTip');
   if (tip) {
     tip.classList.remove('hidden');
     tip.textContent = (d.note ? d.note + ' ' : '')
       + '这台机器上 WAN2 不是第二个物理网口，而是把 WAN1 旁边那个口切过去当 WAN 用；'
-      + '启用后该口就不能再接电脑了。切换请到路由器原版管理页的「双 WAN」里操作。';
+      + '启用后该口就不能再接电脑了。';
+  }
+}
+
+async function toggleWan2Fixed(on) {
+  if (!confirm(on
+    ? '确定启用 WAN2？\nWAN1 旁边那个网口会被切成第二个 WAN，之后不能再接电脑/交换机。'
+    : '确定关闭 WAN2？\n该口会恢复成普通 LAN 口。')) return;
+  const btn = $('#btnDwToggle');
+  if (btn) { btn.disabled = true; btn.textContent = '切换中…'; }
+  try {
+    const { data } = await api('/api/dualwan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enable: on }),
+    });
+    if (data.ok) {
+      toast(data.msg || (on ? 'WAN2 已开启' : 'WAN2 已关闭'));
+      await loadDualWan();
+      loadPortLive(true);
+    } else {
+      toast(data.error || '切换失败');
+    }
+  } catch (e) {
+    toast('切换失败：' + (e && e.message ? e.message : e));
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = on ? '关闭 WAN2' : '启用 WAN2'; }
   }
 }
 
