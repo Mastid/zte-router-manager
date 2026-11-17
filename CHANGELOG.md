@@ -3,6 +3,19 @@
 每个版本的升级点写在这里（脚本发布 Release 时会自动取对应版本的段落作为说明）。
 新版本发布前，把升级点加到本文件顶部即可。
 
+## v2.10.0（2026-11-17）
+
+- 新增「中兴原厂 Mesh 组网」功能（网络页顶部卡片）：
+  - 自动识别 Mesh 角色：主路由 / 副路由（被并入其它网络）/ 未启用
+  - 组网拓扑列表：设备名、MAC、IP、回程频段、速率、RSSI（固件字段名未知时原样展示）
+  - 组网设备数、回程频段、Wi-Fi 7 MLO 回程标记、工作模式
+  - 未启用时显示引导说明；固件没有 Mesh 接口时自动降级，不报错
+- 数据源（逆向确认）：vue_meshstatus_json（MeshStatus/t1905DevNum/AccessType/MLOStatus）、
+  vue_topo_data Action=GetALLAP（拓扑列表）、vue_userif_data（MeshEnable/OpenAndSlave）
+- 兼容层新增 mesh/topo 两类资源候选，系统设置的兼容性矩阵同步显示
+- 说明：Mesh 组网/退网要配合固件配网向导（Wizard_Apply + ACTION_MESHTYPE），
+  单独下发容易打坏 Wi-Fi 配置，本期只做展示，配网仍在原版管理页或中兴智慧生活 App 完成
+
 ## v2.9.9（2026-11-17）
 
 - 新增多机型兼容层，不再只适配巡天 BE5100 Pro+ / SR7110：

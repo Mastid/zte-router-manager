@@ -1344,6 +1344,12 @@
 
   <!-- 网络：防蹭网 + 局域网 -->
   <div class="page hidden" id="pgNet">
+    <section class="card" id="meshCard">
+      <div class="card-h"><h2>Mesh 组网</h2><span class="ext" id="meshState">—</span></div>
+      <div id="meshBody"><div class="s" style="color:var(--muted)">读取中…</div></div>
+      <div class="note hidden" id="meshNote"></div>
+    </section>
+
     <section class="card">
       <div class="card-h"><h2>防蹭网模式</h2><span class="ext" id="secModeNow">—</span></div>
       <div id="secModes">
@@ -3786,7 +3792,7 @@ function go(tab) {
   });
   queueDockPill(true);        // 选中块滑到新位置（桌面侧栏是纵向滑）
   window.scrollTo({ top: 0, behavior: 'smooth' });
-  if (tab === 'net') { loadSecurity(); loadLan(); }
+  if (tab === 'net') { loadSecurity(); loadLan(); loadMesh(); }
   if (tab === 'home') {
     loadPortLive(); startPortLive();                  // 网口实况（概览，跟网口状态放一起）
     startNetLive();                                   // 外网速率 1 秒实时刷新
@@ -3864,6 +3870,79 @@ if ($('#btnPlDiag')) {
       pre.textContent = '读取失败：' + (e && e.message ? e.message : e);
     }
   };
+}
+
+// ================= 中兴原厂 Mesh =================
+let MESH = null;
+
+async function loadMesh(force) {
+  const body = $('#meshBody'), tag = $('#meshState'), note = $('#meshNote');
+  if (!body) return;
+  if (MESH && !force) { renderMesh(); return; }
+  try {
+    const { data } = await api('/api/mesh');
+    MESH = data || {};
+  } catch (e) {
+    MESH = { ok: false, error: (e && e.message) || String(e) };
+  }
+  renderMesh();
+}
+
+function meshApsHtml(aps) {
+  return (aps || []).map((ap) => {
+    const name = ap.name || (ap.raw && (ap.raw.Alias || ap.raw.EthPortAliasName)) || '未命名设备';
+    const bits = [];
+    if (ap.mac) bits.push('MAC ' + esc(ap.mac));
+    if (ap.ip) bits.push('IP ' + esc(ap.ip));
+    if (ap.band) bits.push(esc(ap.band));
+    if (ap.rate) bits.push(esc(ap.rate));
+    if (ap.rssi) bits.push('RSSI ' + esc(ap.rssi) + ' dBm');
+    const extra = ap.raw ? Object.keys(ap.raw)
+      .filter((k) => !/^(Alias|APAlias|DeviceName|MeshDevName|APName|Name|MACAddress|APMac|MeshDevMAC|MAC|Proof|IPAddress|APIP|MeshDevIP|IP|AccessType|ConnectFreBand|FreBand|LinkFreBand|Band|LinkRate|ConnectRate|Rate|Linkrate|RSSI|APRSSI|RSSIValue|TopologyType|ApType|Role|DevType|_InstID)$/.test(k))
+      .slice(0, 6).map((k) => k + '=' + esc(ap.raw[k])) : [];
+    return `<div class="dwrow"><div><div class="dwv">${esc(name)}</div>
+      <div class="s" style="font-size:10.5px;color:var(--muted)">${bits.join(' · ') || '—'}`
+      + (extra.length ? `<br><span style="opacity:.75">${extra.join('&nbsp;&nbsp;')}</span>` : '')
+      + `</div></div></div>`;
+  }).join('');
+}
+
+function renderMesh() {
+  const body = $('#meshBody'), tag = $('#meshState'), note = $('#meshNote');
+  if (!body || !MESH) return;
+  if (MESH.ok === false) {
+    tag.textContent = '读取失败';
+    body.innerHTML = `<div class="s" style="color:var(--muted)">${esc(MESH.error || '未知错误')}</div>`;
+    if (note) { note.classList.add('hidden'); }
+    return;
+  }
+  if (!MESH.supported) {
+    tag.textContent = '不支持';
+    body.innerHTML = `<div class="s" style="color:var(--muted)">这台固件没有中兴原厂 Mesh 接口，卡片仅保留展示。</div>`;
+    if (note) note.classList.add('hidden');
+    return;
+  }
+  tag.textContent = MESH.roleLabel || '—';
+  let html = '';
+  if (MESH.enabled) {
+    html += meshApsHtml(MESH.aps && MESH.aps.length ? MESH.aps : null)
+      || `<div class="s" style="color:var(--muted)">Mesh 已启用，但拓扑列表为空${MESH.devNum ? '（固件上报 ' + MESH.devNum + ' 台）' : ''}。</div>`;
+    const facts = [];
+    if (MESH.devNum) facts.push('组网设备 ' + MESH.devNum + ' 台');
+    if (MESH.accessType) facts.push('回程 ' + esc(MESH.accessType));
+    if (MESH.mlo) facts.push('MLO 回程');
+    if (MESH.workMode) facts.push('工作模式 ' + esc(MESH.workMode));
+    if (facts.length) {
+      html = `<div class="s" style="font-size:11px;color:var(--muted);margin-bottom:6px">${facts.join(' · ')}</div>` + html;
+    }
+  } else {
+    html = `<div class="s" style="color:var(--muted)">未启用 Mesh 组网。</div>`;
+  }
+  body.innerHTML = html;
+  if (note) {
+    note.classList.remove('hidden');
+    note.textContent = MESH.note || '';
+  }
 }
 
 // ================= 防蹭网 =================
@@ -4909,6 +4988,7 @@ async function runSpeed() {
     show('main');
     await load();
     loadCompat();                     // 兼容性报告（后端已缓存则秒回）
+    loadMesh();                       // Mesh 组网状态（网络页用，登录后先取一次缓存渲染）
     loadPortLive(); startPortLive();  // 冷启动默认页就是概览：load() 只刷 /api/all，
                                       // 不触发 go('home')，网口实况会一直卡在「读取中」
     startNetLive();                   // 同理会停在初始的「—」，这里开始 1 秒实时采样

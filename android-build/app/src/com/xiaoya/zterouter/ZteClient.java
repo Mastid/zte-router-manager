@@ -3874,6 +3874,200 @@ public class ZteClient {
         return compatJson();
     }
 
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> firstInst(Object o) {
+        if (o instanceof List && !((List<Object>) o).isEmpty()) {
+            return asMap(((List<Object>) o).get(0));
+        }
+        if (o instanceof Map) return asMap(o);
+        return new LinkedHashMap<String, Object>();
+    }
+
+    /** 拓扑 AP 实例字段 → 展示字段（各固件命名不一，逐个别名试；找不到就空着） */
+    private static String apPick(Map<String, String> inst, String... keys) {
+        for (String k : keys) {
+            String v = nz(inst.get(k)).trim();
+            if (v.length() > 0) return v;
+        }
+        return "";
+    }
+
+    /** 中兴原厂 Mesh：状态 + 拓扑（只读）。组网/退网要配合固件配网向导，不在此实现。 */
+    public synchronized String meshJson() {
+        try {
+            return meshJsonInner();
+        } catch (NotLogged e) {
+            return "{\"ok\":false,\"error\":\"NOT_LOGGED\",\"detail\":" + jstr(error) + "}";
+        } catch (Exception e) {
+            return "{\"ok\":false,\"error\":" + jstr(msg(e)) + "}";
+        }
+    }
+
+    private synchronized String meshJsonInner() throws NotLogged {
+        if (!logged) return "{\"ok\":false,\"error\":\"未登录\"}";
+        try {
+            // 1) userif：MeshEnable / OpenAndSlave（本机角色）
+            String meshEnable = "", openSlave = "", workMode = "", topoVer = "";
+            boolean hasUserif = false;
+            try {
+                Resp r = req("/?_type=hiddenData&_tag=vue_userif_data&_=" + System.currentTimeMillis(), null, 8);
+                if (r.status == 200 && r.body != null && r.body.contains("OBJ_GLOBAL_ENV")) {
+                    Map<String, String> env = firstTag(r.body, "OBJ_GLOBAL_ENV");
+                    if (env != null && !env.isEmpty()) {
+                        hasUserif = true;
+                        meshEnable = nz(str(env.get("MeshEnable")));
+                        openSlave = nz(str(env.get("OpenAndSlave"))).toLowerCase(Locale.ROOT);
+                        workMode = nz(str(env.get("curWorkMode")));
+                        topoVer = nz(str(env.get("TopoPageVer")));
+                    }
+                }
+            } catch (Exception e) {
+                trace("读 userif(mesh) 失败 " + msg(e));
+            }
+
+            // 2) meshstatus：JSON / XML 都可能，候选 tag 逐个试
+            String meshStatus = "", accessType = "", mloStatus = "", t1905 = "";
+            boolean hasMeshStat = false;
+            String[] mTags = {"vue_meshstatus_json", "vue_meshstatus_json_no_update_sess",
+                    "vue_meshstatus_data"};
+            for (String tg : mTags) {
+                try {
+                    Resp r = req("/?_type=vuejsonData&_tag=" + tg
+                            + "&_reqstatus=1&_=" + System.currentTimeMillis(), null, 8);
+                    if (r.status != 200 || r.body == null || !r.body.contains("OBJ_")) continue;
+                    hasMeshStat = true;
+                    String b = r.body.trim();
+                    Map<String, String> top = new LinkedHashMap<String, String>();
+                    Map<String, String> sta = new LinkedHashMap<String, String>();
+                    if (b.startsWith("{")) {
+                        Map<String, Object> root = asMap(MiniJson.parse(b));
+                        Map<String, Object> t = firstInst(root.get("OBJ_LISTAPTOPO_ID"));
+                        for (Map.Entry<String, Object> en : t.entrySet()) {
+                            top.put(en.getKey(), nz(str(en.getValue())));
+                        }
+                        Map<String, Object> s = firstInst(root.get("OBJ_WLAN_STA_STATUS_PROFILE_ID"));
+                        for (Map.Entry<String, Object> en : s.entrySet()) {
+                            sta.put(en.getKey(), nz(str(en.getValue())));
+                        }
+                    } else {
+                        top = firstTag(b, "OBJ_LISTAPTOPO_ID");
+                        sta = firstTag(b, "OBJ_WLAN_STA_STATUS_PROFILE_ID");
+                    }
+                    meshStatus = nz(top.get("MeshStatus"));
+                    accessType = nz(top.get("AccessType"));
+                    mloStatus = nz(sta.get("MLOStatus"));
+                    t1905 = nz(top.get("t1905DevNum"));
+                    break;
+                } catch (Exception ignore) { }
+            }
+
+            // 3) 拓扑列表：GetALLAP（XML，MGET_INST_NUM 是顶层标量）
+            int mget = -1;
+            StringBuilder aps = new StringBuilder("[");
+            int apN = 0;
+            boolean hasTopo = false;
+            try {
+                Resp tr = req("/?_type=vueData&_tag=vue_topo_data&Action=GetALLAP&_="
+                        + System.currentTimeMillis(), null, 10);
+                if (tr.status == 404) {
+                    trace("mesh 拓扑接口不存在(404)");
+                } else if (dead(tr.body)) {
+                    logged = false;
+                    pwdCache.clear();
+                    if (relogin()) {
+                        tr = req("/?_type=vueData&_tag=vue_topo_data&Action=GetALLAP&_="
+                                + System.currentTimeMillis(), null, 10);
+                    } else {
+                        throw new NotLogged();
+                    }
+                }
+                if (tr.status == 200 && tr.body != null && tr.body.contains("OBJ_")) {
+                    hasTopo = true;
+                    java.util.regex.Matcher mm = java.util.regex.Pattern
+                            .compile("<MGET_INST_NUM>(\\d+)</MGET_INST_NUM>")
+                            .matcher(tr.body);
+                    if (mm.find()) mget = Integer.parseInt(mm.group(1));
+                    Map<String, List<Map<String, String>>> g = groups(tr.body);
+                    for (Map.Entry<String, List<Map<String, String>>> en : g.entrySet()) {
+                        String k = en.getKey();
+                        if (k.startsWith("OBJ_AJAX") || k.endsWith("_GET_ID")) continue;
+                        for (Map<String, String> inst : en.getValue()) {
+                            String name = apPick(inst, "Alias", "APAlias", "DeviceName",
+                                    "MeshDevName", "APName", "Name");
+                            String mac = apPick(inst, "MACAddress", "APMac", "MeshDevMAC", "MAC", "Proof");
+                            String ip = apPick(inst, "IPAddress", "APIP", "MeshDevIP", "IP");
+                            String band = apPick(inst, "AccessType", "ConnectFreBand", "FreBand",
+                                    "LinkFreBand", "Band");
+                            String rate = apPick(inst, "LinkRate", "ConnectRate", "Rate", "Linkrate");
+                            String rssi = apPick(inst, "RSSI", "APRSSI", "RSSIValue");
+                            String roleF = apPick(inst, "TopologyType", "ApType", "Role", "DevType");
+                            if (apN > 0) aps.append(",");
+                            aps.append("{\"name\":").append(jstr(name))
+                              .append(",\"mac\":").append(jstr(mac))
+                              .append(",\"ip\":").append(jstr(ip))
+                              .append(",\"band\":").append(jstr(band))
+                              .append(",\"rate\":").append(jstr(rate))
+                              .append(",\"rssi\":").append(jstr(rssi))
+                              .append(",\"role\":").append(jstr(roleF)).append("}");
+                            apN++;
+                        }
+                    }
+                }
+            } catch (NotLogged nl) {
+                throw nl;
+            } catch (Exception e) {
+                trace("读 mesh 拓扑失败 " + msg(e));
+            }
+            aps.append("]");
+            hasTopo = hasTopo && (apN > 0 || mget >= 0);
+
+            boolean mlo = "1".equals(mloStatus);
+            boolean enabled = "1".equals(meshStatus) || "1".equals(meshEnable);
+            boolean slave = "true".equals(openSlave);
+            String role = enabled ? (slave ? "slave" : "master") : "off";
+            String roleLabel = enabled ? (slave ? "副路由（已并入其它网络）" : "主路由") : "未启用";
+            int devNum = 0;
+            try {
+                // 设备数：t1905DevNum（meshstatus）→ MGET_INST_NUM（topo）→ 实例数 兜底
+                for (String c : new String[]{t1905, mget >= 0 ? String.valueOf(mget) : "",
+                        apN > 0 ? String.valueOf(apN) : ""}) {
+                    if (c.length() > 0) {
+                        devNum = Integer.parseInt(c);
+                        if (devNum > 0) break;
+                        devNum = 0;
+                    }
+                }
+            } catch (Exception ignore) { }
+
+            String note;
+            if ("slave".equals(role)) {
+                note = "这台路由器被并入了别的 Mesh 网络（主路由是另一台设备）。";
+            } else if ("master".equals(role)) {
+                note = "已组网 " + (devNum > 0 ? devNum : 1) + " 台设备"
+                        + (mlo ? "，Wi-Fi 7 MLO 回程" : "") + "。";
+            } else {
+                note = "这台路由器还没有组 Mesh。在原版管理页「MESH 组网配置」或中兴智慧生活 App "
+                        + "里添加 Mesh 设备后，这里会显示组网拓扑（主/副路由、回程频段、信号强度）。";
+            }
+
+            return "{\"ok\":true,\"supported\":" + (hasUserif || hasMeshStat || hasTopo)
+                    + ",\"enabled\":" + enabled
+                    + ",\"role\":" + jstr(role)
+                    + ",\"roleLabel\":" + jstr(roleLabel)
+                    + ",\"devNum\":" + devNum
+                    + ",\"accessType\":" + jstr(accessType)
+                    + ",\"mlo\":" + mlo
+                    + ",\"workMode\":" + jstr(workMode)
+                    + ",\"topoVer\":" + jstr(topoVer)
+                    + ",\"aps\":" + aps
+                    + ",\"note\":" + jstr(note) + "}";
+        } catch (NotLogged nl) {
+            throw nl;
+        } catch (Exception e) {
+            return "{\"ok\":false,\"error\":" + jstr(msg(e)) + "}";
+        }
+    }
+
     /**
      * 机型自动识别：登录后读 DevName（产品名）+ WEBTitle / SoftwareVer（硬件型号、软件版本）。
      * 登录前固件不提供机型，此时返回上次识别到的结果（网页层缓存在 localStorage）。

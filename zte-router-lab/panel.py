@@ -372,6 +372,162 @@ def api_compat_redetect():
     return {"ok": True, "report": api_compat(), "family": r.get("family")}
 
 
+# ---------------------------------------------------------------- 中兴原厂 Mesh
+
+# 拓扑 AP 实例字段 → 展示字段（各固件命名不一，逐个别名试）
+_MESH_AP_KEYS = {
+    "name": ("Alias", "APAlias", "DeviceName", "MeshDevName", "APName", "Name"),
+    "mac": ("MACAddress", "APMac", "MeshDevMAC", "MAC", "Proof"),
+    "ip": ("IPAddress", "APIP", "MeshDevIP", "IP"),
+    "band": ("AccessType", "ConnectFreBand", "FreBand", "LinkFreBand", "Band"),
+    "rate": ("LinkRate", "ConnectRate", "Rate", "Linkrate"),
+    "rssi": ("RSSI", "APRSSI", "RSSIValue"),
+    "role": ("TopologyType", "ApType", "Role", "DevType"),
+}
+
+
+def _mesh_ap_map(inst):
+    out = {}
+    for k, keys in _MESH_AP_KEYS.items():
+        for key in keys:
+            v = (inst.get(key) or "").strip()
+            if v:
+                out[k] = v
+                break
+    # 没映射到的字段原样带给前端（新固件字段名未知时也能看到东西）
+    out["raw"] = {k: v for k, v in inst.items() if v not in ("", None)}
+    return out
+
+
+def _userif_env():
+    """GET vue_userif_data（只读），取 OBJ_GLOBAL_ENV 里的 Mesh/角色字段"""
+    try:
+        st, txt = req("/?_type=hiddenData&_tag=vue_userif_data&_=%d"
+                      % int(time.time() * 1000))
+        if st != 200 or not txt or is_login_page(txt) or "OBJ_" not in txt:
+            return {}
+        g = groups(txt).get("OBJ_GLOBAL_ENV") or []
+        return g[0] if g else {}
+    except Exception as e:
+        _slog("读 userif 失败 %s" % e)
+        return {}
+
+
+def _mesh_status_raw():
+    """Mesh 状态：vuejsonData 可能回 JSON 也可能回 XML，两种都接"""
+    try:
+        d = vget("mesh")
+        if d:
+            return d
+    except RuntimeError:
+        raise
+    except Exception as e:
+        _slog("vget mesh 失败 %s" % e)
+    try:
+        st, txt = req(compat.path("mesh") + "&_=%d" % int(time.time() * 1000))
+        txt = (txt or "").strip()
+        if st == 200 and txt.startswith("{"):
+            try:
+                return json.loads(txt)
+            except Exception:
+                return {}
+        if st == 200:
+            return groups(txt)
+    except Exception as e:
+        _slog("读 mesh 状态失败 %s" % e)
+    return {}
+
+
+def _mesh_topo_raw():
+    """Mesh 拓扑：GetALLAP 的 XML。返回 (MGET_INST_NUM, ap实例列表)"""
+    try:
+        st, txt = req(compat.path("topo") + "&_=%d" % int(time.time() * 1000))
+        if st != 200 or not txt or "OBJ_" not in txt:
+            return None, []
+        m = re.search(r"<MGET_INST_NUM>(\d+)</MGET_INST_NUM>", txt)
+        n = int(m.group(1)) if m else None
+        g = groups(txt)
+        insts = []
+        for tag, lst in g.items():
+            if tag.startswith("OBJ_AJAX") or tag.endswith("_GET_ID"):
+                continue
+            for inst in lst:
+                insts.append(_mesh_ap_map(inst))
+        return n, insts
+    except RuntimeError:
+        raise
+    except Exception as e:
+        _slog("读 mesh 拓扑失败 %s" % e)
+        return None, []
+
+
+def api_mesh():
+    """中兴原厂 Mesh：状态 + 拓扑（只读）。
+
+    组网/退网要配合固件配网向导（Wizard_Apply + ACTION_MESHTYPE），单独写容易把
+    Wi-Fi 配置打坏，所以这里只做展示；固件返回什么就展示什么，字段名未知时也原样带出。
+    """
+    env = _userif_env()
+    stat = _mesh_status_raw()
+    top_list = stat.get("OBJ_LISTAPTOPO_ID") if isinstance(stat, dict) else None
+    top = (top_list or [{}])[0]
+    mlo_inst = (stat.get("OBJ_WLAN_STA_STATUS_PROFILE_ID") or [{}])[0] \
+        if isinstance(stat, dict) else {}
+
+    mesh_status = (top.get("MeshStatus") or "").strip()
+    mlo = (mlo_inst.get("MLOStatus") or "").strip() == "1"
+    mesh_enable = (env.get("MeshEnable") or "").strip()
+    open_slave = (env.get("OpenAndSlave") or "").strip().lower() == "true"
+
+    try:
+        mget, aps = _mesh_topo_raw()
+    except RuntimeError:
+        raise
+    except Exception:
+        mget, aps = None, []
+
+    enabled = mesh_status == "1" or mesh_enable == "1"
+    if enabled:
+        role = "slave" if open_slave else "master"
+    else:
+        role = "off"
+    dev_num = None
+    for cand in (top.get("t1905DevNum"), mget, len(aps) or None):
+        try:
+            if cand is not None and int(cand) > 0:
+                dev_num = int(cand)
+                break
+        except (TypeError, ValueError):
+            continue
+
+    if role == "slave":
+        role_label = "副路由（已并入其它网络）"
+        note = "这台路由器被并入了别的 Mesh 网络（主路由是另一台设备）。"
+    elif role == "master":
+        role_label = "主路由"
+        note = "已组网 %d 台设备%s。" % (dev_num or (len(aps) or 1),
+                                        "，Wi-Fi 7 MLO 回程" if mlo else "")
+    else:
+        role_label = "未启用"
+        note = ("这台路由器还没有组 Mesh。在原版管理页「MESH 组网配置」或中兴智慧生活 App "
+                "里添加 Mesh 设备后，这里会显示组网拓扑（主/副路由、回程频段、信号强度）。")
+
+    return {
+        "ok": True,
+        "supported": bool(env or stat or aps),   # userif 都读不到 → 该固件大概率无 Mesh
+        "enabled": enabled,
+        "role": role,
+        "roleLabel": role_label,
+        "devNum": dev_num,
+        "accessType": (top.get("AccessType") or "").strip(),
+        "mlo": mlo,
+        "workMode": (env.get("curWorkMode") or "").strip(),
+        "topoVer": (env.get("TopoPageVer") or "").strip(),
+        "aps": aps,
+        "note": note,
+    }
+
+
 def feel_token():
     """取一个新的一次性令牌（用只读业务接口，不能用登录接口，否则会顶掉当前会话）
 
@@ -785,7 +941,7 @@ def band_of(inst):
 
 
 # ---------- 设备信息（面板自身运行环境，手机端由原生层提供） ----------
-APP_VER = "2.9.9"
+APP_VER = "2.10.0"
 START_TS = time.time()
 
 
@@ -3198,6 +3354,12 @@ class H(BaseHTTPRequestHandler):
             try:
                 self._json(api_compat())
             except Exception as e:
+                self._json({"ok": False, "error": str(e)})
+            return
+        if p == "/api/mesh":
+            try:
+                self._guard(api_mesh)
+            except RuntimeError as e:
                 self._json({"ok": False, "error": str(e)})
             return
         if p == "/api/dualwan":

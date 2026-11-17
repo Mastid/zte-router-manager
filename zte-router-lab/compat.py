@@ -148,6 +148,26 @@ RESOURCES = {
             {"family": FAMILY_VUE, "type": VUE, "tag": "vueinfo_data", "probe": "OBJ_"},
         ],
     },
+    # 中兴原厂 Mesh：组网状态（OBJ_LISTAPTOPO_ID / OBJ_WLAN_STA_STATUS_PROFILE_ID）
+    "mesh": {
+        "label": "Mesh 状态",
+        "cands": [
+            {"family": FAMILY_VUE, "type": VUEJ, "tag": "vue_meshstatus_json",
+             "extra": "_reqstatus=1", "probe": "OBJ_"},
+            {"family": FAMILY_VUE, "type": VUEJ, "tag": "vue_meshstatus_json_no_update_sess",
+             "extra": "_reqstatus=1", "probe": "OBJ_"},
+            {"family": FAMILY_VUE, "type": VUE, "tag": "vue_meshstatus_data", "probe": "OBJ_"},
+        ],
+    },
+    # 中兴原厂 Mesh：拓扑列表（GetALLAP，apData.MGET_INST_NUM + AP 实例）
+    "topo": {
+        "label": "Mesh 拓扑",
+        "cands": [
+            {"family": FAMILY_VUE, "type": VUE, "tag": "vue_topo_data",
+             "extra": "Action=GetALLAP", "probe": "MGET_INST_NUM"},
+            {"family": FAMILY_VUE, "type": VUE, "tag": "vue_topo_data", "probe": "OBJ_"},
+        ],
+    },
 }
 
 # ---------------------------------------------------------------- 机型画像
