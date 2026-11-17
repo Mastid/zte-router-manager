@@ -1145,7 +1145,7 @@
       </svg>
     </div>
     <h1>中兴路由管家</h1>
-    <p class="sub">巡天 BE5100 Pro+ <em>·</em> ZXSLC SR7110</p>
+    <p class="sub" id="lgModel">中兴路由器</p>
     <div class="lg-sec">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round">
         <path d="M12 3.2l7 2.6v5.4c0 4.3-2.9 7.6-7 9.2-4.1-1.6-7-4.9-7-9.2V5.8z"/>
@@ -1933,6 +1933,7 @@ async function api(path, opts) {
     else if (path === '/api/sysinfo') raw = await zcall('sysinfo');
     else if (path === '/api/logout') raw = await zcall('logout');
     else if (path === '/api/diag') raw = await zcall('diag');
+    else if (path === '/api/model') raw = await zcall('model');
     else if (path === '/api/limits') raw = await zcall('limits');
     else if (path.indexOf('/api/sysstat') === 0) raw = await zcall('sysStat');
     else if (path === '/api/ports/raw') raw = await zcall('portsraw');
@@ -2087,6 +2088,7 @@ async function doLogin() {
     btn.disabled = false;
     if (txt) txt.textContent = '登录';
   }
+  loadModel();   // 登录成功就刷新机型缓存，下次打开登录页直接显示真实型号
 }
 
 // 密码显示/隐藏
@@ -3722,7 +3724,30 @@ async function load(silent) {
   }
 }
 
+// ---------- 机型自动识别：登录后读到就缓存，下次打开登录页直接显示真实型号 ----------
+async function loadModel() {
+  const el = $('#lgModel');
+  let m = null;
+  try {
+    const { data } = await api('/api/model');
+    if (data && data.ok && data.label) m = data;
+  } catch (e) {}
+  if (m) {
+    if (el) el.innerHTML = `${esc(m.dev || m.label)}${m.web ? ' <em>·</em> ' + esc(m.web) : ''}`;
+    try { localStorage.setItem('zte_model', JSON.stringify({ dev: m.dev || '', web: m.web || '' })); } catch (e) {}
+    return;
+  }
+  // 还没登录过（固件登录前不给机型）：用上次缓存，没有就保持通用名
+  try {
+    const c = JSON.parse(localStorage.getItem('zte_model') || 'null');
+    if (c && (c.dev || c.web) && el) {
+      el.innerHTML = `${esc(c.dev || '中兴路由器')}${c.web ? ' <em>·</em> ' + esc(c.web) : ''}`;
+    }
+  } catch (e) {}
+}
+
 $('#btnLogin').onclick = doLogin;
+loadModel();
 $('#pwd').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
 $('#btnRefresh').onclick = () => load();
 // 设备列表用事件委托：行是每次刷新重建的，逐行挂 onclick 会随 innerHTML 一起被冲掉

@@ -88,6 +88,8 @@ public class ZteClient {
     private String kickedIp = "", kickedMac = "";
     private long kickedAt;
     private String pendingIp = "", pendingMac = "";
+    /** 机型自动识别：DevName=产品名，WEBTitle=硬件型号，SoftwareVer=软件版本（登录后才有） */
+    private String modelDev = "", modelWeb = "", modelSw = "";
 
     public static final String VER = "1.1";
     /** 会话令牌的携带方式，登录后自动挑选可用的那个 */
@@ -3618,6 +3620,42 @@ public class ZteClient {
     }
 
     /** 双 WAN 现状：WAN1 主口 + WAN2 端口与状态 + 可选的 LAN 口 */
+    /**
+     * 机型自动识别：登录后读 DevName（产品名）+ WEBTitle / SoftwareVer（硬件型号、软件版本）。
+     * 登录前固件不提供机型，此时返回上次识别到的结果（网页层缓存在 localStorage）。
+     */
+    public synchronized String modelJson() {
+        if (logged) {
+            try {
+                Resp r = req("/?_type=vueData&_tag=vue_home_device_data_no_update_sess&_="
+                        + System.currentTimeMillis(), null, 8);
+                if (r.status == 200 && r.body != null && r.body.indexOf("OBJ_HOME_BASICINFO_ID") >= 0) {
+                    Map<String, String> inst = firstTag(r.body, "OBJ_HOME_BASICINFO_ID");
+                    String d = inst == null ? "" : nz(str(inst.get("DevName")));
+                    if (d.length() > 0) modelDev = d;
+                }
+            } catch (Exception e) {
+                trace("读机型(DevName)失败 " + msg(e));
+            }
+            try {
+                Resp r = req("/?_type=hiddenScene&_tag=initial_info_json&_="
+                        + System.currentTimeMillis(), null, 8);
+                Map<String, Object> data = asMap(asMap(MiniJson.parse(r.body)).get("data"));
+                String w = nz(str(data.get("WEBTitle")));
+                String s = nz(str(data.get("SoftwareVer")));
+                if (w.length() > 0) modelWeb = w;
+                if (s.length() > 0) modelSw = s;
+            } catch (Exception e) {
+                trace("读机型(WEBTitle)失败 " + msg(e));
+            }
+        }
+        String label = modelDev.length() > 0 && modelWeb.length() > 0
+                ? modelDev + " · " + modelWeb : (modelDev + modelWeb);
+        return "{\"ok\":true,\"label\":" + jstr(label)
+                + ",\"dev\":" + jstr(modelDev) + ",\"web\":" + jstr(modelWeb)
+                + ",\"sw\":" + jstr(modelSw) + ",\"logged\":" + logged + "}";
+    }
+
     public synchronized String dualwanJson() {
         try {
             Resp eth = req("/?_type=hiddenData&_tag=vue_internet_eth_data&_=" + System.currentTimeMillis(), null, 10);

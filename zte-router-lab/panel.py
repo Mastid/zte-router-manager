@@ -2694,6 +2694,79 @@ def api_ports_raw():
     }
 
 
+# ---------------- 机型自动识别 ----------------
+
+MODEL_FILE = os.path.join(BASE_DIR, "logs", "model.json")
+MODEL = {"dev": "", "web": "", "sw": "", "at": 0}
+
+
+def _model_load():
+    """启动时把上次识别到的机型读回来（登录页在登录前就要显示）"""
+    try:
+        with open(MODEL_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            for k in ("dev", "web", "sw"):
+                MODEL[k] = (d.get(k) or "").strip()
+            MODEL["at"] = int(d.get("at") or 0)
+    except Exception:
+        pass
+
+
+def _model_read():
+    """登录后现读机型：
+
+    * DevName（vue_home_device_data_no_update_sess → OBJ_HOME_BASICINFO_ID）
+      = 产品名，如「巡天BE5100 Pro+」
+    * WEBTitle / SoftwareVer（hiddenScene → initial_info_json，登录后才有）
+      = 硬件型号「ZXSLC SR7110」+ 软件版本
+    """
+    got = {}
+    try:
+        st, txt = req("/?_type=vueData&_tag=vue_home_device_data_no_update_sess&_=%d"
+                      % int(time.time() * 1000), timeout=8)
+        if st == 200 and txt and "OBJ_HOME_BASICINFO_ID" in txt:
+            inst = (_insts(txt, "OBJ_HOME_BASICINFO_ID") or [{}])[0]
+            got["dev"] = (inst.get("DevName") or "").strip()
+    except Exception:
+        pass
+    try:
+        st, txt = req("/?_type=hiddenScene&_tag=initial_info_json&_=%d"
+                      % int(time.time() * 1000), timeout=8)
+        data = (json.loads(txt).get("data") or {})
+        got["web"] = (data.get("WEBTitle") or "").strip()
+        got["sw"] = (data.get("SoftwareVer") or "").strip()
+    except Exception:
+        pass
+    got = {k: v for k, v in got.items() if v}
+    if got:
+        MODEL.update(got)
+        MODEL["at"] = int(time.time())
+        try:
+            with open(MODEL_FILE, "w", encoding="utf-8") as f:
+                json.dump(MODEL, f, ensure_ascii=False)
+        except Exception:
+            pass
+    return MODEL
+
+
+def api_model():
+    """机型（登录页展示用，不需要登录）：已登录就现读并更新缓存，否则返回上次识别结果"""
+    if S.get("logged"):
+        try:
+            _model_read()
+        except Exception:
+            pass
+    dev, web = MODEL.get("dev", ""), MODEL.get("web", "")
+    label = " · ".join([x for x in (dev, web) if x])
+    return {"ok": True, "label": label, "dev": dev, "web": web,
+            "sw": MODEL.get("sw", ""), "at": MODEL.get("at", 0),
+            "logged": bool(S.get("logged"))}
+
+
+_model_load()
+
+
 def api_dualwan():
     return lanwan.api_dualwan()
 
@@ -2874,6 +2947,9 @@ class H(BaseHTTPRequestHandler):
             return
         if p == "/api/ports":
             self._guard(api_port_status)
+            return
+        if p == "/api/model":
+            self._json(api_model())
             return
         if p == "/api/dualwan":
             self._guard(api_dualwan)
