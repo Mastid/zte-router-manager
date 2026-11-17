@@ -567,6 +567,14 @@
   }
   .chip:active{background:var(--brand-soft);color:var(--brand);border-color:transparent}
   .chip.on{background:var(--brand-soft);color:var(--brand);border-color:transparent;font-weight:640}
+  .chip.ok{
+    background:var(--brand-soft);color:var(--brand);border-color:transparent;
+    font-weight:620;cursor:default;
+  }
+  .chip.no{
+    background:var(--soft);color:var(--muted);border-color:var(--line);
+    text-decoration:line-through;text-decoration-thickness:1px;opacity:.72;cursor:default;
+  }
   .ont-guide{
     margin-top:11px;padding-top:10px;border-top:1px solid var(--line);
     font-size:12px;color:var(--muted);line-height:1.62;
@@ -1432,6 +1440,17 @@
     </section>
 
     <section class="card">
+      <div class="card-h"><h2>兼容性</h2><span class="ext" id="cpFam">—</span></div>
+      <div class="kv3" id="cpInfo"><div class="ir"><div class="k">识别中</div><div class="v">—</div></div></div>
+      <div class="chips" id="cpCaps" style="margin-top:11px"></div>
+      <div class="sheet-btns">
+        <button class="btn2" id="btnCpCopy">复制报告</button>
+        <button class="btn2 pri" id="btnCpAgain">重新检测</button>
+      </div>
+      <div class="info" id="cpTip" style="margin-top:9px">换路由器或升级固件后点「重新检测」，会自动重新识别接口与可用功能。</div>
+    </section>
+
+    <section class="card">
       <div class="card-h"><h2>本机信息</h2><span class="ext" id="phInfoTag">手机</span></div>
       <div class="kv3" id="phInfo"><div class="ir"><div class="k">读取中</div><div class="v">—</div></div></div>
       <button class="linkbtn" id="btnPhCopy" style="width:100%;margin-top:12px">复制设备信息</button>
@@ -1948,6 +1967,8 @@ async function doLogin() {
     if (txt) txt.textContent = '登录';
   }
   loadModel();   // 登录成功就刷新机型缓存，下次打开登录页直接显示真实型号
+  // 后端登录后会在后台探测一次固件能力，稍等片刻再把报告取回来
+  setTimeout(() => { loadCompat(); }, 2600);
 }
 
 // 密码显示/隐藏
@@ -2850,7 +2871,7 @@ function render(d) {
   resolveVendors(d.clients);
 
   // 系统设置页正开着时，路由器信息跟着一起刷新
-  if (typeof TAB !== 'undefined' && TAB === 'set') renderRouterInfo();
+  if (typeof TAB !== 'undefined' && TAB === 'set') { renderRouterInfo(); loadCompat(); }
 }
 
 let LAST = null;
@@ -3774,7 +3795,7 @@ function go(tab) {
     stopNetLive();
   }
   if (tab === 'set') {
-    loadLan(); loadSysInfo(); loadRemote(); loadDualWan();
+    loadLan(); loadSysInfo(); loadRemote(); loadDualWan(); loadCompat();
   }
 
   // 远程访问开关（绑一次即可）
@@ -4326,8 +4347,131 @@ function phoneRows() {
   ];
 }
 
-function renderRouterInfo() {
-  const tag = document.getElementById('rtInfoTag');
+// ---------------- 兼容性（多机型适配） ----------------
+let CMP = null;              // 最近一次兼容性报告
+let CMP_BUSY = false;
+
+function cpEsc(s) { return esc(String(s == null ? '' : s)); }
+
+function renderCompat(d) {
+  if (!d || !d.ok) {
+    const tip = $('#cpTip');
+    if (tip) tip.textContent = (d && d.error) ? ('读取兼容性信息失败：' + d.error) : '暂时读不到兼容性信息';
+    return;
+  }
+  CMP = d;
+  const fam = $('#cpFam');
+  if (fam) fam.textContent = d.familyLabel || '—';
+
+  const box = $('#cpInfo');
+  if (box) {
+    const m = d.model || {};
+    const rows = [
+      ['机型', d.label || '未识别（登录一次后自动识别）'],
+      ['产品名', m.dev || '—'],
+      ['硬件型号', m.web || '—'],
+      ['软件版本', m.sw || '—'],
+      ['固件族', d.familyLabel || '—'],
+      ['登录方式', d.familyLogin || '—'],
+    ];
+    box.innerHTML = rows.map(([k, v]) =>
+      `<div class="ir"><div class="k">${cpEsc(k)}</div><div class="v">${cpEsc(v || '—')}</div></div>`).join('');
+  }
+
+  const caps = $('#cpCaps');
+  if (caps) {
+    const list = d.caps || [];
+    caps.innerHTML = list.length
+      ? list.map((c) => `<span class="chip ${c.ok ? 'ok' : 'no'}" title="${cpEsc(c.ok ? ('接口：' + (c.via || '—')) : (c.hint || '该机型无此接口'))}">${c.ok ? '✓' : '✕'} ${cpEsc(c.label)}</span>`).join('')
+      : '<span class="chip no">还没探测</span>';
+  }
+
+  const tip = $('#cpTip');
+  if (tip) {
+    const list = d.caps || [];
+    const ok = list.filter((c) => c.ok).length;
+    const notes = (d.notes || []).length ? ' · ' + d.notes.join('；') : '';
+    if (!d.probed) {
+      tip.textContent = '登录后会自动探测这台路由器支持哪些接口；未登录时只做大致识别。';
+    } else {
+      const bad = list.filter((c) => !c.ok).map((c) => c.label);
+      tip.textContent = `已识别 ${ok}/${list.length} 项能力，结果已缓存${notes}`
+        + (bad.length ? `。本机不支持：${bad.join('、')}（相关功能已自动隐藏或置灰）` : '。全部功能可用');
+    }
+  }
+}
+
+async function loadCompat(force) {
+  if (CMP && !force) { renderCompat(CMP); return CMP; }
+  if (CMP_BUSY) return CMP;
+  CMP_BUSY = true;
+  try {
+    let d;
+    if (force) {
+      const r = await api('/api/compat', { method: 'POST', body: '{}' });
+      d = (r.data && r.data.report) || r.data || {};
+      CMP = null;
+    } else {
+      const r = await api('/api/compat');
+      d = r.data || {};
+    }
+    renderCompat(d);
+    return d;
+  } catch (e) {
+    renderCompat({ ok: false, error: String(e && e.message || e) });
+    return null;
+  } finally {
+    CMP_BUSY = false;
+  }
+}
+
+function compatReportText() {
+  const d = CMP;
+  if (!d) return '兼容性报告尚未生成';
+  const m = d.model || {};
+  const lines = [
+    '中兴路由管家 · 兼容性报告',
+    '机型：' + (d.label || '未识别'),
+    '产品名：' + (m.dev || '—'),
+    '硬件型号：' + (m.web || '—'),
+    '软件版本：' + (m.sw || '—'),
+    '固件族：' + (d.familyLabel || '—') + '（' + (d.family || '?') + '）',
+    '登录方式：' + (d.familyLogin || '—'),
+    '探测状态：' + (d.probed ? '已完成' : '未完成（未登录）'),
+    '能力：',
+  ];
+  (d.caps || []).forEach((c) => {
+    lines.push('  ' + (c.ok ? '[√]' : '[×]') + ' ' + c.label + (c.via ? '  ← ' + c.via : ''));
+  });
+  if ((d.notes || []).length) lines.push('备注：' + d.notes.join('；'));
+  lines.push('时间：' + new Date().toLocaleString());
+  return lines.join('\n');
+}
+
+(function bindCompat() {
+  const again = $('#btnCpAgain');
+  if (again) again.onclick = async () => {
+    if (again.disabled) return;
+    again.disabled = true;
+    const old = again.textContent;
+    again.textContent = '检测中…';
+    try { await loadCompat(true); } finally {
+      again.disabled = false;
+      again.textContent = old;
+    }
+  };
+  const copy = $('#btnCpCopy');
+  if (copy) copy.onclick = async () => {
+    if (typeof copyText === 'function') {
+      await copyText(compatReportText());
+      const old = copy.textContent;
+      copy.textContent = '已复制';
+      setTimeout(() => { copy.textContent = old; }, 1200);
+    }
+  };
+})();
+
+function renderRouterInfo() {  const tag = document.getElementById('rtInfoTag');
   if (tag) tag.textContent = (LAST && LAST.dev && LAST.dev.model) || '—';
   const box = document.getElementById('rtInfo');
   if (box) box.innerHTML = kvHtml(routerRows());
@@ -4764,6 +4908,7 @@ async function runSpeed() {
     $('#loginErr').textContent = '';
     show('main');
     await load();
+    loadCompat();                     // 兼容性报告（后端已缓存则秒回）
     loadPortLive(); startPortLive();  // 冷启动默认页就是概览：load() 只刷 /api/all，
                                       // 不触发 go('home')，网口实况会一直卡在「读取中」
     startNetLive();                   // 同理会停在初始的「—」，这里开始 1 秒实时采样

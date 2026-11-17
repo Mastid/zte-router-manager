@@ -24,6 +24,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from Crypto.Cipher import AES, PKCS1_v1_5
 from Crypto.PublicKey import RSA
 
+import compat          # 固件族探测 / 资源解析（多机型适配）
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 HOST = os.environ.get("ZTE_HOST", "192.168.5.1")
 PORT = int(os.environ.get("ZTE_PORT", "8900"))
@@ -188,13 +190,203 @@ def req(path, data=None, timeout=12):
             return e.code, e.read().decode("utf-8", "replace")
 
 
-def feel_token():
-    """取一个新的一次性令牌（用只读业务接口，不能用登录接口，否则会顶掉当前会话）"""
-    with ROUTER:
+# ---------- 兼容层：资源 → 实际接口路径 ----------
+
+def _probe_get(path):
+    """探测专用：不改会话状态，只回报 (status, text)"""
+    try:
+        return req(path, timeout=8)
+    except Exception:
+        return 0, ""
+
+
+def _res_path(res, fallback_tag=None):
+    """资源名 → 当前固件上可用的路径（依赖 compat 的探测缓存）"""
+    return compat.path(res, fallback_tag)
+
+
+def _goform_as_groups(res):
+    """经典固件（goform）读取 → 包装成上层熟悉的 OBJ_ 结构。
+
+    只做基础信息/版本/终端/外网四类；拿不到的字段留空，界面自然降级。
+    这段属于「实验性适配」：不同代 goform 固件的 cmd 名有差异，缺失时返回空。
+    """
+    cmds = {
+        "device": "deviceName,cr_version,wa_inner_version,web_version,Language,"
+                  "uptime,wan_ipaddr,wan_connect_status,network_type,network_signalbar,station_num",
+        "version": "deviceName,cr_version,wa_inner_version,web_version,Language",
+        "clients": "station_list,lan_station_list,station_num",
+        "wan": "wan_ipaddr,wan_connect_status,network_type,network_signalbar,ppp_status",
+    }.get(res)
+    if not cmds:
+        return {}
+    d = gget(cmds)
+    if not d:
+        return {}
+    up = str(d.get("wan_connect_status", "")).strip() in ("1", "connected", "true")
+    if res in ("device", "version"):
+        basic = {
+            "DevName": (d.get("deviceName") or "").strip(),
+            "WANStatus": "1" if up else "0",
+            "IPAddress": (d.get("wan_ipaddr") or "").strip(),
+            "NetworkType": (d.get("network_type") or "").strip(),
+            "SignalBar": (d.get("network_signalbar") or "").strip(),
+            "UpTime": (d.get("uptime") or "").strip(),
+            "SoftwareVer": (d.get("wa_inner_version") or d.get("cr_version") or "").strip(),
+            "WebVer": (d.get("web_version") or "").strip(),
+        }
+        return {"OBJ_HOME_BASICINFO_ID": [basic], "OBJ_GLOBAL_ENV": [{"Source": "goform"}]}
+    if res == "wan":
+        return {"OBJ_ETHWANCPPP_ID": [{
+            "ConnStatus": "1" if up else "0",
+            "IPAddress": (d.get("wan_ipaddr") or "").strip(),
+            "NetworkType": (d.get("network_type") or "").strip(),
+        }]}
+    if res == "clients":
+        out = []
+        raw = d.get("station_list") or d.get("lan_station_list") or ""
         try:
-            req("/?_type=vueData&_tag=vue_home_device_data", timeout=8)
+            arr = json.loads(raw) if isinstance(raw, str) and raw.strip().startswith("[") else []
         except Exception:
-            pass
+            arr = []
+        for it in arr if isinstance(arr, list) else []:
+            if not isinstance(it, dict):
+                continue
+            out.append({
+                "MACAddress": it.get("mac_addr") or it.get("mac") or "",
+                "HostName": it.get("hostname") or it.get("host_name") or "",
+                "IPAddress": it.get("ip_addr") or it.get("ip") or "",
+                "Interface": it.get("port") or "",
+            })
+        return {"OBJ_CLIENTS_ID": out} if out else {}
+    return {}
+
+
+def vget(res, fallback_tag=None):
+    """按资源取 XML 分组（新固件）；该资源不可用时返回空字典，不抛异常。
+
+    和老代码 fetch("/?_type=vueData&_tag=xxx") 等价，只是 tag 由兼容层挑。
+    经典固件族（goform）走 JSON 接口，再翻译成同样的 OBJ_ 结构。
+    """
+    if compat.S.get("family") == compat.FAMILY_GOFORM:
+        try:
+            return _goform_as_groups(res)
+        except Exception as e:
+            _slog("goform 读 %s 失败 %s" % (res, e))
+            return {}
+    p = _res_path(res, fallback_tag)
+    if not p or "_tag=&" in p or p.endswith("_tag="):
+        return {}
+    try:
+        return fetch(p)
+    except RuntimeError:
+        raise
+    except Exception as e:
+        _slog("vget %s 失败 %s" % (res, e))
+        return {}
+
+
+def gget(cmds, timeout=10):
+    """经典固件读取：/goform/goform_get_cmd_process 返回 JSON，转成 {cmd: value}"""
+    path = ("/goform/goform_get_cmd_process?isTest=false&cmd=%s&multi_data=1"
+            % urllib.parse.quote(cmds if isinstance(cmds, str) else ",".join(cmds)))
+    try:
+        st, txt = req(path, timeout=timeout)
+    except Exception:
+        return {}
+    if st != 200 or not (txt or "").strip().startswith("{"):
+        return {}
+    try:
+        d = json.loads(txt)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def gset(form, timeout=10):
+    """经典固件写入：POST /goform/goform_set_cmd_process（实验性）"""
+    body = dict(form)
+    body.setdefault("isTest", "false")
+    try:
+        st, txt = req("/goform/goform_set_cmd_process", body, timeout=timeout)
+        return st, txt
+    except Exception as e:
+        return 0, str(e)
+
+
+def compat_run(logged=None):
+    """跑一次探测（登录后才有意义；未登录只做免登录识别）"""
+    if logged is None:
+        logged = bool(S.get("logged"))
+    r = compat.detect(_probe_get, logged=logged)
+    if logged:
+        _model_read()                       # 顺手把型号喂给画像
+        compat.set_model(MODEL.get("dev", ""), MODEL.get("web", ""), MODEL.get("sw", ""))
+    return r
+
+
+def _compat_bootstrap():
+    """登录成功后后台探测一次能力（不阻塞界面；失败只留日志，下次启动再试）"""
+    if compat.S.get("probed"):
+        return
+
+    def run():
+        try:
+            compat_run(logged=True)
+        except Exception as e:
+            _slog("兼容探测失败 %s" % e)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+def api_compat():
+    """兼容性报告：登录状态下若还没探测过，自动补一次（失败不影响返回）"""
+    if S.get("logged") and not compat.S.get("probed"):
+        try:
+            compat_run()
+        except Exception as e:
+            _slog("兼容探测失败 %s" % e)
+    elif not S.get("logged") and not compat.S.get("family"):
+        # 未登录：只做登录页特征识别（很轻，一个 GET）
+        try:
+            compat_run(logged=False)
+        except Exception as e:
+            _slog("登录页识别失败 %s" % e)
+    rep = compat.report()
+    rep["model"] = {"dev": MODEL.get("dev", ""), "web": MODEL.get("web", ""),
+                    "sw": MODEL.get("sw", "")}
+    # 面板自身对某些机型的已知限制，直接告诉前端要怎么降级
+    rep["limits"] = {
+        "wan2Fixed": compat.has_quirk("wan2_fixed"),
+        "preempt": compat.has_quirk("preempt_on_login"),
+        "ispLocked": compat.has_quirk("isp_locked"),
+        "goformOnly": compat.has_quirk("goform_only"),
+    }
+    return rep
+
+
+def api_compat_redetect():
+    """重新探测（用户换机 / 升级固件后用）"""
+    compat.reset()
+    r = compat_run()
+    return {"ok": True, "report": api_compat(), "family": r.get("family")}
+
+
+def feel_token():
+    """取一个新的一次性令牌（用只读业务接口，不能用登录接口，否则会顶掉当前会话）
+
+    某些机型只有 *_no_update_sess 这类「不刷新会话」的接口，打它令牌不会变；
+    这里依次试几个常规读接口，直到令牌真的换新为止。
+    """
+    with ROUTER:
+        for res in ("device", "wan", "clients", "wifi"):
+            before = S["token"]
+            try:
+                req(_res_path(res), timeout=8)
+            except Exception:
+                continue
+            if S["token"] and S["token"] != before:
+                break
         return S["token"]
 
 
@@ -389,6 +581,32 @@ def _login_once(password, prefer_header=False):
     return False, "登录失败：%s" % (msg or txt[:100]), False
 
 
+def _login_goform(password):
+    """经典固件登录（实验性）：POST /goform/goform_set_cmd_process，goformId=LOGIN
+
+    老款 MF / AC / E / ZXHN 系列用 base64(密码) 提交，成功返回 {"result":"0"}。
+    这里只负责「能不能登上」，登不上就把原因带回去，不影响新固件的登录路径。
+    """
+    b64 = base64.b64encode(password.encode("utf-8")).decode("ascii")
+    st, txt = gset({"goformId": "LOGIN", "password": b64})
+    if st == 0:
+        return False, "经典固件登录接口不可达"
+    if st != 200:
+        return False, "经典固件登录接口返回 HTTP %s" % st
+    t = (txt or "").strip()
+    if not t.startswith("{"):
+        return False, "经典固件登录接口不存在（返回的不是 JSON）"
+    try:
+        res = json.loads(t)
+    except Exception:
+        return False, "经典固件登录应答无法解析"
+    if str(res.get("result")) == "0":
+        S.update(logged=True, error=None, at=time.time(), pwd=password, claim=True)
+        compat.S["family"] = compat.FAMILY_GOFORM
+        return True, None
+    return False, "经典固件登录被拒（result=%s）" % res.get("result")
+
+
 def login(password, preempt=True):
     """登录并确认会话生效：被别的设备占着时自动接管（把前面的会话顶下线）。
 
@@ -401,6 +619,16 @@ def login(password, preempt=True):
             rounds += 1
             ok, err, retry = _login_once(password, prefer_header=(rounds == 2))
             if not ok:
+                # 新固件接口不存在时（返回登录页 HTML / 非 JSON），改试经典固件登录
+                if err and ("没有返回 JSON" in err or "登录响应异常" in err) and rounds == 1:
+                    gok, gerr = _login_goform(password)
+                    if gok:
+                        _sess_log("登录成功（经典固件 goform）")
+                        _compat_bootstrap()
+                        return True
+                    last = gerr or err
+                    S.update(logged=False, error=last)
+                    return False
                 last = err or last
                 if not retry:
                     S.update(logged=False, error=last)
@@ -417,8 +645,8 @@ def login(password, preempt=True):
                 # 兜底：AX3000 等机型「登录即顶掉别人」时也带 preempt 提示，会话其实是好的；
                 # 接管流程没走通不代表会话不可用，直接读一次数据定生死。
                 try:
-                    st2, txt2 = req("/?_type=vueData&_tag=vue_home_device_data&_=%d"
-                                    % int(time.time() * 1000))
+                    st2, txt2 = req(_res_path("device", "vue_home_device_data")
+                                    + "&_=%d" % int(time.time() * 1000))
                     if st2 == 200 and txt2 and not _dead(txt2):
                         claimed = True
                         info = None
@@ -428,6 +656,7 @@ def login(password, preempt=True):
             if claimed:
                 S.update(logged=True, error=None, at=time.time(), pwd=password, claim=True)
                 _sess_log("登录成功")
+                _compat_bootstrap()
                 return True
             last = _preempt_msg(info, tried=preempt)
             # 顶号最多走两轮，别把登录接口刷爆（固件名额释放有延迟，隔一下再抢）
@@ -556,7 +785,7 @@ def band_of(inst):
 
 
 # ---------- 设备信息（面板自身运行环境，手机端由原生层提供） ----------
-APP_VER = "2.9.4"
+APP_VER = "2.9.9"
 START_TS = time.time()
 
 
@@ -580,12 +809,12 @@ def api_sysinfo():
 # ---------- 业务 ----------
 
 def read_wifi_raw():
-    return fetch("/?_type=vueData&_tag=wifiAP_data")
+    return vget("wifi", "wifiAP_data")
 
 
 def _read_net():
     """外网实时计数器：只读一次 home_device_data，给 1 秒轮询用（比 /api/all 轻得多）"""
-    home = fetch("/?_type=vueData&_tag=vue_home_device_data")
+    home = vget("device", "vue_home_device_data")
     basic = (home.get("OBJ_HOME_BASICINFO_ID") or [{}])[0]
     return {
         "ok": True,
@@ -606,11 +835,11 @@ def api_net():
 
 
 def api_all():
-    home = fetch("/?_type=vueData&_tag=vue_home_device_data")
+    home = vget("device", "vue_home_device_data")
     env = (home.get("OBJ_GLOBAL_ENV") or [{}])[0]
     basic = (home.get("OBJ_HOME_BASICINFO_ID") or [{}])[0]
 
-    net = fetch("/?_type=vueData&_tag=vue_internet_data")
+    net = vget("wan", "vue_internet_data")
     wan = (net.get("OBJ_ETHWANCPPP_ID") or [{}])[0]
 
     wifi_raw = read_wifi_raw()
@@ -632,7 +861,7 @@ def api_all():
         })
     wifi.sort(key=lambda x: 0 if x["band"] == "2.4G" else 1)
 
-    clients_raw = fetch("/?_type=vueData&_tag=vue_client_data")
+    clients_raw = vget("clients", "vue_client_data")
     bands = _band_map()
     clients = []
     for c in clients_raw.get("OBJ_CLIENTS_ID", []):
@@ -981,6 +1210,15 @@ def _num_or_none(v):
 SYS_LOG = os.path.join(BASE_DIR, "logs", "sysstat.log")
 PORTS_PATH = "/?_type=vuejsonData&_tag=vue_eth_portname&GET_TYPE=WANSTATUS"
 
+
+def ports_path():
+    """网口接口：优先用兼容层解析出来的路径，解析不到再退回本机实测路径"""
+    p = compat.path("ports")
+    if not p or p.endswith("_tag=") or "_tag=&" in p:
+        return PORTS_PATH
+    return p
+
+
 # 机身丝印 ←→ 固件端口名 的对齐表。
 # 实测这台 SR7110：机身 LAN1 口接的台式电脑，固件在 OBJ_CLIENTS_ID[].Interface 里报成
 # eth2（别名 LAN2）；机身 LAN3 的 NAS 报 eth3（LAN3）。也就是固件的 LAN1/LAN2 与丝印相反，
@@ -1162,7 +1400,7 @@ def _wan_speed_hint():
     """WAN 协商速率兜底：首页 OBJ_HOME_BASICINFO_ID.WANSpeed（「连接详情」卡用的就是它）"""
     def go():
         try:
-            home = fetch("/?_type=vueData&_tag=vue_home_device_data")
+            home = vget("device", "vue_home_device_data")
             basic = (home.get("OBJ_HOME_BASICINFO_ID") or [{}])[0]
             v = str(basic.get("WANSpeed") or "").strip()
             try:
@@ -1183,7 +1421,7 @@ def read_ports():
     name = 机身丝印名（已按 PORT_SWAP 校正），fw = 固件里的别名（LAN1/LAN2/LAN3），
     if = 接口名（eth1..eth3），设备归属就按 if 精确匹配。
     """
-    st, txt = req(PORTS_PATH, timeout=6)
+    st, txt = req(ports_path(), timeout=6)
     if st != 200:
         raise RuntimeError("网口状态接口返回 HTTP %s" % st)
     try:
@@ -1291,7 +1529,7 @@ def api_sysstat(force=False):
         except Exception:
             pass
         try:
-            home = fetch("/?_type=vueData&_tag=vue_home_device_data")
+            home = vget("device", "vue_home_device_data")
             basic = (home.get("OBJ_HOME_BASICINFO_ID") or [{}])[0]
             wst = (basic.get("WANStatus") or "").strip()
             if wst:
@@ -1397,7 +1635,7 @@ def _cached(key, ttl, fn):
 
 def _clients_raw():
     return _cached("clients", 5,
-                   lambda: fetch("/?_type=vueData&_tag=vue_client_data")) or {}
+                   lambda: vget("clients", "vue_client_data")) or {}
 
 
 def _lan_net():
@@ -1843,7 +2081,7 @@ def api_wifimgr():
 
     env = {}
     try:
-        env = (fetch("/?_type=vueData&_tag=vue_home_device_data").get("OBJ_GLOBAL_ENV") or [{}])[0]
+        env = (vget("device", "vue_home_device_data").get("OBJ_GLOBAL_ENV") or [{}])[0]
     except Exception:
         pass
     return {"ok": True, "bands": bands, "channels": chans, "compat": compat,
@@ -2662,7 +2900,7 @@ def api_port_status():
 
 def api_ports_raw():
     """网口字段诊断：这台固件到底为每个口上报了哪些字段（真机排查速率显示用）"""
-    st, txt = req(PORTS_PATH, timeout=6)
+    st, txt = req(ports_path(), timeout=6)
     data = {}
     try:
         data = (json.loads(txt) or {}).get("data") or {}
@@ -2765,6 +3003,7 @@ def api_model():
 
 
 _model_load()
+compat.load()          # 复用上次的接口探测结果（首次为空，登录后自动补）
 
 
 def api_dualwan():
@@ -2868,7 +3107,10 @@ class H(BaseHTTPRequestHandler):
             return
         if p == "/api/state":
             self._json({"logged": S["logged"], "error": S["error"],
-                        "kicked": S.get("kick"), "pending": S.get("pending")})
+                        "kicked": S.get("kick"), "pending": S.get("pending"),
+                        # 兼容层摘要：前端登录页/设置页据此显示机型与固件族
+                        "family": compat.S.get("family"),
+                        "modelLabel": compat.label()})
             return
         if p == "/api/sysinfo":
             self._json(api_sysinfo())
@@ -2951,6 +3193,13 @@ class H(BaseHTTPRequestHandler):
         if p == "/api/model":
             self._json(api_model())
             return
+        if p == "/api/compat":
+            # 兼容性报告：不强制登录（未登录只回缓存/免登录识别结果）
+            try:
+                self._json(api_compat())
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)})
+            return
         if p == "/api/dualwan":
             self._guard(api_dualwan)
             return
@@ -2976,6 +3225,9 @@ class H(BaseHTTPRequestHandler):
             ok = login(data.get("password", ""), preempt=bool(data.get("preempt", True)))
             self._json({"ok": ok, "error": S["error"], "kicked": S.get("kick") if ok else None,
                         "pending": S.get("pending") if not ok else None})
+            return
+        if p == "/api/compat":
+            self._guard(lambda: api_compat_redetect())
             return
         if p == "/api/dualwan":
             self._guard(lambda: api_dualwan_save(data))

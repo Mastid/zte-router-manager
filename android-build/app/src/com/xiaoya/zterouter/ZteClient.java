@@ -429,6 +429,10 @@ public class ZteClient {
         sb.append(",\"bodyHead\":").append(jstr(head));
         sb.append(",\"logged\":").append(logged);
         sb.append(",\"mode\":").append(jstr(sendMode));
+        // 兼容层摘要：出问题时一眼看出是哪种固件、哪些接口被退回
+        sb.append(",\"family\":").append(jstr(nz(detectFamily())));
+        sb.append(",\"familyLabel\":").append(jstr(familyLabelOf(family)));
+        sb.append(",\"resolved\":").append(jstr(resTag.toString()));
         sb.append(",\"lastError\":").append(jstr(error));
         sb.append(",\"trace\":").append(jstr(trace.toString()));
         sb.append('}');
@@ -631,6 +635,11 @@ public class ZteClient {
             String lt = str(info.get("logintoken"));
             String sess = str(info.get("_sessionToken"));
             if (lt == null || lt.isEmpty()) {
+                // 新固件接口不存在 → 可能是经典固件（MF/AC/E/ZXHN），改走 goform 登录
+                if (loginGoform(pwd)) {
+                    trace("经典固件登录成功（goform）");
+                    return true;
+                }
                 error = "取登录令牌失败，路由器没有返回预期内容";
                 trace("取令牌失败 body=" + cut(r.body, 120));
                 return false;
@@ -2773,14 +2782,18 @@ public class ZteClient {
     }
 
     private String apiAll() throws IOException, NotLogged {
-        Map<String, List<Map<String, String>>> home = fetch("/?_type=vueData&_tag=vue_home_device_data");
+        Map<String, List<Map<String, String>>> home = fetchRes("device",
+                "vue_home_device_data", "vue_home_device_data_no_update_sess",
+                "vue_dev_info_data", "homestate_data");
         Map<String, String> env = first(home, "OBJ_GLOBAL_ENV");
         Map<String, String> basic = first(home, "OBJ_HOME_BASICINFO_ID");
 
-        Map<String, List<Map<String, String>>> net = fetch("/?_type=vueData&_tag=vue_internet_data");
+        Map<String, List<Map<String, String>>> net = fetchRes("wan",
+                "vue_internet_data", "vuecfg_data", "vue_internet_wan_select_data");
         Map<String, String> wan = first(net, "OBJ_ETHWANCPPP_ID");
 
-        Map<String, List<Map<String, String>>> wifiRaw = fetch("/?_type=vueData&_tag=wifiAP_data");
+        Map<String, List<Map<String, String>>> wifiRaw = fetchRes("wifi",
+                "wifiAP_data", "ssid_data", "netwlanap_data", "vue_wifissid_data");
         Map<String, Map<String, String>> psk = new HashMap<String, Map<String, String>>();
         for (Map<String, String> x : list(wifiRaw, "OBJ_WLANPSK_ID")) {
             psk.put(nz(x.get("_InstID_PSK")), x);
@@ -2810,7 +2823,9 @@ public class ZteClient {
         for (Map<String, String> w : wifi) if ("2.4G".equals(w.get("band"))) sortedWifi.add(w);
         for (Map<String, String> w : wifi) if (!"2.4G".equals(w.get("band"))) sortedWifi.add(w);
 
-        Map<String, List<Map<String, String>>> cl = fetch("/?_type=vueData&_tag=vue_client_data");
+        Map<String, List<Map<String, String>>> cl = fetchRes("clients",
+                "vue_client_data", "localnet_lan_detailinfo_lua",
+                "vue_landevice_data", "accessdev_data");
         List<Map<String, String>> clients = new ArrayList<Map<String, String>>();
         for (Map<String, String> c : list(cl, "OBJ_CLIENTS_ID")) {
             Map<String, String> x = new LinkedHashMap<String, String>();
@@ -3619,7 +3634,246 @@ public class ZteClient {
                 + ",\"at\":" + (System.currentTimeMillis() / 1000) + "}";
     }
 
-    /** 双 WAN 现状：WAN1 主口 + WAN2 端口与状态 + 可选的 LAN 口 */
+    // ---------------- 兼容层：多机型适配 ----------------
+    // 同一份业务数据在不同固件上 tag 名可能不同（例如 AX3000 没有 vue_home_device_data），
+    // 这里按候选列表探测一次、记住命中的那个，之后固定用它；探测不到就退回第一个候选。
+    private final Map<String, String> resTag = new LinkedHashMap<String, String>();
+    private String family = "";
+    private boolean compatProbed;
+    private long compatAt;
+
+    /** 家族标签（前端展示用） */
+    private static String familyLabelOf(String f) {
+        if ("vue".equals(f)) return "新固件（vue 接口）";
+        if ("goform".equals(f)) return "经典固件（goform 接口）";
+        if ("luci".equals(f)) return "OpenWrt 定制（luci 接口）";
+        return "未识别";
+    }
+
+    private static String familyLoginOf(String f) {
+        if ("vue".equals(f)) return "logintoken + sha256(密码+token)";
+        if ("goform".equals(f)) return "goform_set_cmd_process + base64 密码";
+        if ("luci".equals(f)) return "luci 会话（暂未适配）";
+        return "未知";
+    }
+
+    private static String familyDescOf(String f) {
+        if ("vue".equals(f)) return "巡天 / 问天 / AX / BE 系列，?_type=vueData&_tag=… 接口体系";
+        if ("goform".equals(f)) return "MF / AC / E 系列及部分 ZXHN 光猫，goform_get_cmd_process 接口";
+        if ("luci".equals(f)) return "部分企业/定制机型，/cgi-bin/luci/ 接口";
+        return "接口特征与已知家族都不符，需要抓包补适配";
+    }
+
+    /** 免登录：从登录页特征判断固件族（一个 GET，不产生会话） */
+    private String detectFamily() {
+        if (family != null && !family.isEmpty()) return family;
+        try {
+            Resp r = req("/", null, 8);
+            String t = r.body == null ? "" : r.body.toLowerCase(Locale.ROOT);
+            if (t.contains("/jquery/static") || t.contains("g_sessiontmptoken")
+                    || t.contains("logintoken") || t.contains("_type=loginscene")) {
+                family = "vue";
+            } else if (t.contains("goform") || t.contains("getpage.gch")
+                    || t.contains("wa_inner_version")) {
+                family = "goform";
+            } else if (t.contains("luci")) {
+                family = "luci";
+            } else {
+                family = "unknown";
+            }
+            trace("固件族识别：" + family);
+        } catch (Exception e) {
+            family = "unknown";
+            trace("固件族识别失败 " + msg(e));
+        }
+        return family;
+    }
+
+    /** 资源 → 路径：探测候选 tag，命中的缓存起来 */
+    private String resPath(String key, String... tags) {
+        String hit = resTag.get(key);
+        if (hit != null) return "/?_type=vueData&_tag=" + hit;
+        for (String tg : tags) {
+            try {
+                Resp r = req("/?_type=vueData&_tag=" + tg + "&_=" + System.currentTimeMillis(), null, 8);
+                if (r.status == 200 && r.body != null
+                        && (r.body.contains("OBJ_") || r.body.contains("<Instance>"))) {
+                    resTag.put(key, tg);
+                    trace("资源 " + key + " 命中 " + tg);
+                    return "/?_type=vueData&_tag=" + tg;
+                }
+            } catch (Exception ignore) {
+            }
+        }
+        String def = tags.length > 0 ? tags[0] : "";
+        resTag.put(key, def);
+        trace("资源 " + key + " 候选全不通，退回 " + def);
+        return "/?_type=vueData&_tag=" + def;
+    }
+
+    private Map<String, List<Map<String, String>>> fetchRes(String key, String... tags)
+            throws IOException, NotLogged {
+        return fetch(resPath(key, tags));
+    }
+
+    /** 经典固件登录（实验性）：POST /goform/goform_set_cmd_process，成功返回 {"result":"0"} */
+    private boolean loginGoform(String pwd) {
+        try {
+            LinkedHashMap<String, String> f = new LinkedHashMap<String, String>();
+            f.put("isTest", "false");
+            f.put("goformId", "LOGIN");
+            f.put("password", b64e(pwd.getBytes(StandardCharsets.UTF_8)));
+            Resp r = req("/goform/goform_set_cmd_process", f, 12);
+            trace("goform 登录 status=" + r.status + " body=" + cut(r.body, 100));
+            if (r.status != 200 || r.body == null || !r.body.trim().startsWith("{")) return false;
+            Map<String, Object> res = asMap(MiniJson.parse(r.body));
+            if ("0".equals(nz(str(res.get("result"))))) {
+                family = "goform";
+                logged = true;
+                checked = true;
+                error = null;
+                adminPwd = pwd;
+                pwdCache.clear();
+                return true;
+            }
+        } catch (Exception e) {
+            trace("goform 登录异常 " + msg(e));
+        }
+        return false;
+    }
+
+    /** 机型画像里的已知差异（只做提示；能力以实测为准） */
+    private String quirksJson() {
+        String b = (nz(modelDev) + " " + nz(modelWeb)).toUpperCase(Locale.ROOT);
+        StringBuilder sb = new StringBuilder("[");
+        boolean first = true;
+        String[][] q = {
+                {"wan2_fixed", "BE5100 SR7110 AX3000 AX1500"},
+                {"preempt_on_login", "AX3000 BE5100 BE7200 AX5400"},
+                {"goform_only", "MC801 MC888 MF AC30 ZXHN"},
+        };
+        for (String[] row : q) {
+            boolean hit = false;
+            for (String k : row[1].split(" ")) {
+                if (k.length() > 0 && b.contains(k)) { hit = true; break; }
+            }
+            if (!hit) continue;
+            if (!first) sb.append(',');
+            first = false;
+            sb.append(jstr(row[0]));
+        }
+        return sb.append(']').toString();
+    }
+
+    /** 兼容性报告：与网页端 /api/compat 同结构 */
+    public synchronized String compatJson() {
+        detectFamily();
+        if (logged && !compatProbed) {
+            probeCaps();
+        }
+        StringBuilder caps = new StringBuilder("[");
+        String[][] res = {
+                {"device", "设备信息", "vue_home_device_data"},
+                {"version", "版本与型号", "initial_info_json"},
+                {"wifi", "无线状态", "wifiAP_data"},
+                {"wan", "外网连接", "vue_internet_data"},
+                {"clients", "在线终端", "vue_client_data"},
+                {"ports", "物理网口", "vue_eth_portname"},
+                {"dualwan", "双 WAN", "vue_dualwan_data"},
+                {"sysstat", "系统负载", "vue_sysinfo_data"},
+        };
+        boolean first = true;
+        int okCount = 0;
+        for (String[] row : res) {
+            boolean ok = resTag.containsKey(row[0]);
+            if (ok) okCount++;
+            if (!first) caps.append(',');
+            first = false;
+            caps.append("{\"res\":").append(jstr(row[0]))
+                .append(",\"label\":").append(jstr(row[1]))
+                .append(",\"ok\":").append(ok)
+                .append(",\"via\":").append(jstr(capVia(row[0])))
+                .append(",\"hint\":").append(jstr(ok ? "" : "该机型没有对应接口，相关功能会自动隐藏"))
+                .append('}');
+        }
+        caps.append(']');
+
+        String label = nz(modelDev).length() > 0 && nz(modelWeb).length() > 0
+                ? modelDev + " · " + modelWeb : nz(modelDev) + nz(modelWeb);
+        String qj = quirksJson();
+        StringBuilder sb = new StringBuilder(1024);
+        sb.append("{\"ok\":true")
+          .append(",\"family\":").append(jstr(nz(family)))
+          .append(",\"familyLabel\":").append(jstr(familyLabelOf(family)))
+          .append(",\"familyDesc\":").append(jstr(familyDescOf(family)))
+          .append(",\"familyLogin\":").append(jstr(familyLoginOf(family)))
+          .append(",\"label\":").append(jstr(label))
+          .append(",\"model\":{\"dev\":").append(jstr(nz(modelDev)))
+          .append(",\"web\":").append(jstr(nz(modelWeb)))
+          .append(",\"sw\":").append(jstr(nz(modelSw))).append('}')
+          .append(",\"quirks\":").append(qj)
+          .append(",\"probed\":").append(compatProbed)
+          .append(",\"at\":").append(compatAt)
+          .append(",\"caps\":").append(caps)
+          .append(",\"notes\":[]")
+          .append(",\"limits\":{\"wan2Fixed\":").append(qj.contains("wan2_fixed"))
+          .append(",\"preempt\":").append(qj.contains("preempt_on_login"))
+          .append(",\"ispLocked\":false,\"goformOnly\":").append(qj.contains("goform_only"))
+          .append("}}");
+        return sb.toString();
+    }
+
+    private String capVia(String key) {
+        String t = resTag.get(key);
+        return t == null ? "" : t;
+    }
+
+    /** 逐资源探测候选接口（一次登录只跑一次，结果留在 resTag 里复用） */
+    private void probeCaps() {
+        compatProbed = true;
+        compatAt = System.currentTimeMillis();
+        try {
+            if (!"vue".equals(detectFamily())) {
+                trace("非 vue 固件族，跳过接口探测");
+                return;
+            }
+            resPath("device", "vue_home_device_data", "vue_home_device_data_no_update_sess",
+                    "vue_dev_info_data", "homestate_data");
+            resPath("version", "vue_nowversion_lua", "vue_version_fallback_data");
+            resPath("wifi", "wifiAP_data", "ssid_data", "netwlanap_data", "vue_wifissid_data");
+            resPath("wan", "vue_internet_data", "vuecfg_data", "vue_internet_wan_select_data");
+            resPath("clients", "vue_client_data", "localnet_lan_detailinfo_lua",
+                    "vue_landevice_data", "accessdev_data");
+            // 网口这个接口要带 GET_TYPE，单独探（resPath 只拼 _type/_tag）
+            try {
+                Resp rp = req("/?_type=vuejsonData&_tag=vue_eth_portname&GET_TYPE=WANSTATUS&_="
+                        + System.currentTimeMillis(), null, 8);
+                if (rp.status == 200 && rp.body != null && rp.body.contains("OBJ_ETHPORT")) {
+                    resTag.put("ports", "vue_eth_portname&GET_TYPE=WANSTATUS");
+                }
+            } catch (Exception ignore) {
+            }
+            resPath("dualwan", "vue_dualwan_data", "vue_internet_eth_data");
+            resPath("sysstat", "vue_sysinfo_data", "vue_managdiag", "vueinfo_data");
+            trace("能力探测完成：" + resTag.toString());
+        } catch (Exception e) {
+            trace("能力探测异常 " + msg(e));
+        }
+    }
+
+    /** 重新识别（换机 / 升级固件后用） */
+    public synchronized String compatRedetect() {
+        resTag.clear();
+        compatProbed = false;
+        family = "";
+        detectFamily();
+        if (logged) {
+            try { modelJson(); } catch (Exception ignore) { }
+            probeCaps();
+        }
+        return compatJson();
+    }
+
     /**
      * 机型自动识别：登录后读 DevName（产品名）+ WEBTitle / SoftwareVer（硬件型号、软件版本）。
      * 登录前固件不提供机型，此时返回上次识别到的结果（网页层缓存在 localStorage）。
@@ -3627,8 +3881,9 @@ public class ZteClient {
     public synchronized String modelJson() {
         if (logged) {
             try {
-                Resp r = req("/?_type=vueData&_tag=vue_home_device_data_no_update_sess&_="
-                        + System.currentTimeMillis(), null, 8);
+                Resp r = req(resPath("device", "vue_home_device_data_no_update_sess",
+                        "vue_home_device_data", "vue_dev_info_data", "homestate_data")
+                        + "&_=" + System.currentTimeMillis(), null, 8);
                 if (r.status == 200 && r.body != null && r.body.indexOf("OBJ_HOME_BASICINFO_ID") >= 0) {
                     Map<String, String> inst = firstTag(r.body, "OBJ_HOME_BASICINFO_ID");
                     String d = inst == null ? "" : nz(str(inst.get("DevName")));

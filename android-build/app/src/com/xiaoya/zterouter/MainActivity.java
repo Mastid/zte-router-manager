@@ -435,6 +435,8 @@ public class MainActivity extends Activity {
             if ("portsraw".equals(method)) return client.portsRawJson();
             if ("dualwan".equals(method)) return client.dualwanJson();
             if ("model".equals(method)) return client.modelJson();
+            if ("compat".equals(method)) return client.compatJson();
+            if ("compatRedetect".equals(method)) return client.compatRedetect();
             if ("dualwanset".equals(method)) return client.dualwanSetJson(arg);
             if ("adminpwd".equals(method)) return client.adminPwdJson(arg);
             if ("openUrl".equals(method)) {
