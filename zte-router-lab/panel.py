@@ -413,6 +413,18 @@ def login(password, preempt=True):
                 continue
 
             claimed, info = _claim(preempt=preempt)
+            if not claimed:
+                # 兜底：AX3000 等机型「登录即顶掉别人」时也带 preempt 提示，会话其实是好的；
+                # 接管流程没走通不代表会话不可用，直接读一次数据定生死。
+                try:
+                    st2, txt2 = req("/?_type=vueData&_tag=vue_home_device_data&_=%d"
+                                    % int(time.time() * 1000))
+                    if st2 == 200 and txt2 and not _dead(txt2):
+                        claimed = True
+                        info = None
+                        _sess_log("接管流程未走通，但会话实测可用（AX3000 口径），按登录成功处理")
+                except Exception:
+                    pass
             if claimed:
                 S.update(logged=True, error=None, at=time.time(), pwd=password, claim=True)
                 _sess_log("登录成功")

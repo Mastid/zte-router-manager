@@ -462,6 +462,23 @@ public class ZteClient {
             } catch (Exception e) {
                 trace("校验 mode=" + m + " 异常 " + msg(e));
             }
+            // 机型差异兜底：AX3000 等机型可能没有 vue_home_device_data 这个 tag，
+            // 改用 userif 页校验（登录后必返回；会话无效时是登录页/被占页，都会被 dead() 拦住）
+            try {
+                LinkedHashMap<String, String> f = new LinkedHashMap<String, String>();
+                f.put("IF_ACTION", "Apply");
+                f.put("IsAutoShowWizard", "0");
+                Resp r = req("/?_type=hiddenData&_tag=vue_userif_data", f, 12);
+                boolean d = dead(r.body);
+                trace("校验(兜底userif) mode=" + m + " status=" + r.status + (d ? " 被拒" : " 通过"));
+                if (!d && r.status == 200) {
+                    trace("会话可用（userif 兜底），令牌携带方式=" + m);
+                    if (!"cm".equals(m)) CookieHandler.setDefault(null);
+                    return true;
+                }
+            } catch (Exception e) {
+                trace("校验(兜底userif) mode=" + m + " 异常 " + msg(e));
+            }
         }
         sendMode = "cookie";
         CookieHandler.setDefault(null);
@@ -579,16 +596,19 @@ public class ZteClient {
 
     private boolean login(String pwd) {
         // 固件对登录做一次性令牌校验：取令牌与提交之间只要被别的请求插进来，
-        // 就会返回 e_csrf_check_fail（页面过期）。这里整轮重试一次即可。
-        for (int i = 0; i < 2; i++) {
+        // 就会返回 e_csrf_check_fail（页面过期）。整轮重试即可。
+        // 会话被占（preempt）也自动多试一轮：固件释放名额有延迟，隔一下再抢往往就成功了。
+        for (int i = 0; i < 3; i++) {
             boolean ok = loginOnce(pwd);
             if (ok) return true;
             boolean csrf = error != null && (error.contains("csrf")
                     || error.contains("页面过期") || error.contains("1452"));
-            if (!csrf) return false;
-            trace("登录被判定令牌过期，重取令牌重试 " + (i + 1));
+            boolean busy = error != null && (error.contains("preempt")
+                    || error.contains("管理员会话"));
+            if (!csrf && !(busy && i < 2)) return false;
+            trace("登录失败(" + (csrf ? "令牌过期" : (busy ? "会话被占" : "其他")) + ")，重试 " + (i + 1));
             try {
-                Thread.sleep(350);
+                Thread.sleep(csrf ? 350 : 1200);
             } catch (InterruptedException ignored) {
             }
         }
@@ -633,13 +653,19 @@ public class ZteClient {
                 error = null;
                 adminPwd = pwd;
                 pwdCache.clear();
+                String et = str(res.get("loginErrType"));
+                String em = str(res.get("loginErrMsg"));
+                boolean preemptNote = et != null && et.contains("preempt");
+                // AX3000 等机型「登录即顶掉别人」时也会带 e_exceed_max_user_preemption 提示，
+                // 会话其实是好的——不能凭这个提示判死，一切以 handshake 的实际读写结果为准。
+                if (preemptNote) trace("固件报告 " + et + "：按「已顶掉/待确认」处理，继续校验会话");
                 // 关键：确认这个会话真的能读数据，否则界面会“刚进主页就被弹回登录”。
                 // 若被别的设备占着，claimSession() 会先把它顶下线（login_preempt）。
-                if (!claimSession() || !handshake()) {
+                // claim 失败不直接判死：可能只是顶人失败而会话本身可用，交给 handshake 定夺。
+                if (!claimSession()) trace("claim 未成功，继续用 handshake 校验会话是否真的可用");
+                if (!handshake()) {
                     adminPwd = null;
-                    String et = str(res.get("loginErrType"));
-                    String em = str(res.get("loginErrMsg"));
-                    boolean busy = (et != null && et.contains("preempt")) || pendingIp.length() > 0;
+                    boolean busy = preemptNote || pendingIp.length() > 0;
                     if (busy) noFightUntil = System.currentTimeMillis() + 90000L;
                     logoutNow();               // 会话没建成，主动归还名额（须在 logged=false 之前）
                     if (pendingIp.length() > 0) {
@@ -657,6 +683,7 @@ public class ZteClient {
                     trace("会话校验全部失败，放弃本次登录 errType=" + et);
                     return false;
                 }
+                if (preemptNote) trace("会话校验通过：固件的 preempt 提示未影响本会话，正常进入");
                 return true;
             }
             double lock = num(res.get("lockingTime"));

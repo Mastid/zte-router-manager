@@ -22,7 +22,7 @@ mkdir -p "$OUT/gen" "$OUT/classes" "$OUT/dex"
   --manifest "$APP/AndroidManifest.xml" -A "$APP/assets" \
   --java "$OUT/gen" --auto-add-overlay \
   --min-sdk-version 21 --target-sdk-version 34 \
-  --version-code 57 --version-name "2.9.6" \
+  --version-code 58 --version-name "2.9.7" \
   "$OUT/res.zip"
 
 echo "== 2. 编译 Java =="
@@ -48,9 +48,9 @@ if [ ! -f "$ROOT/debug.keystore" ]; then
     -keyalg RSA -keysize 2048 -validity 10000
 fi
 "$BT/apksigner.bat" sign --ks "$ROOT/debug.keystore" --ks-pass pass:android \
-  --key-pass pass:android --out "$ROOT/ZTE-RouterManager-v2.9.6.apk" \
+  --key-pass pass:android --out "$ROOT/ZTE-RouterManager-v2.9.7.apk" \
   "$OUT/app.aligned.apk"
-"$BT/apksigner.bat" verify "$ROOT/ZTE-RouterManager-v2.9.6.apk"
+"$BT/apksigner.bat" verify "$ROOT/ZTE-RouterManager-v2.9.7.apk"
 
-ls -la "$ROOT/ZTE-RouterManager-v2.9.6.apk"
+ls -la "$ROOT/ZTE-RouterManager-v2.9.7.apk"
 echo "== 构建完成 =="
