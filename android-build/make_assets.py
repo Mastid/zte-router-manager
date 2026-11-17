@@ -68,6 +68,7 @@ async function api(path, opts) {
     else if (path === '/api/model') raw = await zcall('model');
     else if (path === '/api/compat') raw = await zcall(o.method === 'POST' ? 'compatRedetect' : 'compat');
     else if (path === '/api/mesh') raw = await zcall('mesh');
+    else if (path === '/api/secfw') raw = await zcall(o.method === 'POST' ? 'secFwSet' : 'secFw');
     else if (path === '/api/limits') raw = await zcall('limits');
     else if (path.indexOf('/api/sysstat') === 0) raw = await zcall('sysStat');
     else if (path === '/api/ports/raw') raw = await zcall('portsraw');

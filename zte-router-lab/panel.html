@@ -1350,6 +1350,13 @@
       <div class="note hidden" id="meshNote"></div>
     </section>
 
+    <section class="card" id="sfCard">
+      <div class="card-h"><h2>安全防护</h2><span class="ext" id="sfTag">—</span></div>
+      <div id="sfBody"><div class="s" style="color:var(--muted)">读取中…</div></div>
+      <div class="err hidden" id="sfErr" style="text-align:left"></div>
+      <div class="note hidden" id="sfNote"></div>
+    </section>
+
     <section class="card">
       <div class="card-h"><h2>防蹭网模式</h2><span class="ext" id="secModeNow">—</span></div>
       <div id="secModes">
@@ -3792,7 +3799,7 @@ function go(tab) {
   });
   queueDockPill(true);        // 选中块滑到新位置（桌面侧栏是纵向滑）
   window.scrollTo({ top: 0, behavior: 'smooth' });
-  if (tab === 'net') { loadSecurity(); loadLan(); loadMesh(); }
+  if (tab === 'net') { loadSecurity(); loadLan(); loadMesh(); loadFw(); }
   if (tab === 'home') {
     loadPortLive(); startPortLive();                  // 网口实况（概览，跟网口状态放一起）
     startNetLive();                                   // 外网速率 1 秒实时刷新
@@ -3942,6 +3949,150 @@ function renderMesh() {
   if (note) {
     note.classList.remove('hidden');
     note.textContent = MESH.note || '';
+  }
+}
+
+// ================= 安全防护（防火墙 / 防攻击 / 安全日志） =================
+let FW = null;
+const FW_LEVELS = [['High', '高'], ['Middle', '中'], ['Low', '低']];
+
+async function loadFw(force) {
+  const body = $('#sfBody'), tag = $('#sfTag');
+  if (!body) return;
+  if (FW && !force) { renderFw(); return; }
+  try {
+    const { data } = await api('/api/secfw');
+    FW = data || {};
+  } catch (e) {
+    FW = { ok: false, error: (e && e.message) || String(e) };
+  }
+  renderFw();
+}
+
+function fwRow(inner) {
+  return `<div class="dwrow" style="align-items:center">${inner}</div>`;
+}
+
+function fwSwitch(id, on, dis) {
+  return `<label class="sw"><input type="checkbox" id="${id}" ${on ? 'checked' : ''}`
+    + (dis ? ' disabled' : '') + `><i></i></label>`;
+}
+
+function fwChips(side, cur, enabled) {
+  return `<div class="chips" style="gap:6px">` + FW_LEVELS.map(([v, cn]) =>
+    `<button class="chip ${cur === v ? 'on' : ''}" id="sf${side}${v}"`
+    + (enabled ? '' : ' disabled style="opacity:.45;cursor:default"')
+    + ` data-v="${v}">${cn}</button>`).join('') + `</div>`;
+}
+
+function fwLevelLabel(v) {
+  return (FW_LEVELS.find(([k]) => k === v) || ['', v])[1];
+}
+
+function renderFw() {
+  const body = $('#sfBody'), tag = $('#sfTag'), err = $('#sfErr'), note = $('#sfNote');
+  if (!body || !FW) return;
+  err.classList.add('hidden');
+  if (FW.ok === false) {
+    tag.textContent = '读取失败';
+    body.innerHTML = `<div class="s" style="color:var(--muted)">${esc(FW.error || '未知错误')}</div>`;
+    return;
+  }
+  if (!FW.supported) {
+    tag.textContent = '不支持';
+    body.innerHTML = `<div class="s" style="color:var(--muted)">这台固件没有防火墙配置接口（security_firewall_data），卡片仅保留展示。</div>`;
+    return;
+  }
+  tag.textContent = FW.antiAttack ? '保护中' : '未开防护';
+
+  let html = '';
+  if (FW.dual) {
+    html += fwRow(`<div><div class="dwv">IPv4 防火墙</div>
+      <div class="s" style="font-size:10.5px;color:var(--muted)">级别：${fwLevelLabel(FW.ipv4Level)} · 保护局域网设备不被外部发现</div>
+      <div style="margin-top:7px">${fwChips('V4', FW.ipv4Level, FW.ipv4Enable)}</div></div>
+      ${fwSwitch('sfV4on', FW.ipv4Enable)}`);
+    html += fwRow(`<div><div class="dwv">IPv6 防火墙</div>
+      <div class="s" style="font-size:10.5px;color:var(--muted)">级别：${fwLevelLabel(FW.ipv6Level)} · 与 IPv4 相互独立</div>
+      <div style="margin-top:7px">${fwChips('V6', FW.ipv6Level, FW.ipv6Enable)}</div></div>
+      ${fwSwitch('sfV6on', FW.ipv6Enable)}`);
+  } else {
+    html += fwRow(`<div><div class="dwv">防火墙级别</div>
+      <div class="s" style="font-size:10.5px;color:var(--muted)">广域网对局域网/设备本身的访问限制</div>
+      <div style="margin-top:7px">${fwChips('Any', FW.level, true)}</div></div>`);
+  }
+  html += fwRow(`<div><div class="dwv">防攻击保护</div>
+    <div class="s" style="font-size:10.5px;color:var(--muted)">拦截恶意数据包 · 防连接请求爆破 · 过滤虚假报错 · 网络探针保持沉默 · 智能应答限流</div></div>
+    ${fwSwitch('sfAnti', FW.antiAttack)}`);
+  if (FW.secLogSupported) {
+    html += fwRow(`<div><div class="dwv">安全日志（破解 / 攻击记录）</div>
+      <div class="s" style="font-size:10.5px;color:var(--muted)">${FW.secLogEnable
+        ? '记录管理员与 Wi-Fi 密码破解尝试' : '关闭中，开启后开始记录'}</div></div>
+      ${fwSwitch('sfLogon', FW.secLogEnable)}`);
+    html += `<div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+      <button class="chip" id="sfLogRefresh">刷新记录</button>
+      <span class="s" style="font-size:10px;color:var(--muted)">与原厂 App「破解保护记录」同源</span></div>
+      <pre id="sfLog" style="margin:8px 0 0;max-height:180px;overflow:auto;font-size:10.5px;line-height:1.5;`
+      + `white-space:pre-wrap;background:var(--soft);border-radius:10px;padding:9px;color:var(--muted)"`
+      + `>${esc(FW.secLog || '（暂无记录）')}</pre>`;
+  }
+  body.innerHTML = html;
+
+  // 绑定事件
+  const bind = (id, fn) => { const el = $('#' + id); if (el) el.onchange = fn; };
+  const bindClick = (id, fn) => { const el = $('#' + id); if (el) el.onclick = fn; };
+  if (FW.dual) {
+    bind('sfV4on', () => fwSet({ action: 'firewall', ipv4Enable: $('#sfV4on').checked }));
+    bind('sfV6on', () => fwSet({ action: 'firewall', ipv6Enable: $('#sfV6on').checked }));
+    FW_LEVELS.forEach(([v]) => {
+      bindClick('sfV4' + v, () => fwSet({ action: 'firewall', ipv4Level: v }));
+      bindClick('sfV6' + v, () => fwSet({ action: 'firewall', ipv6Level: v }));
+    });
+  } else {
+    FW_LEVELS.forEach(([v]) => bindClick('sfAny' + v, () => fwSet({ action: 'firewall', level: v })));
+  }
+  bind('sfAnti', () => fwSet({ action: 'antiattack', enable: $('#sfAnti').checked }));
+  if (FW.secLogSupported) {
+    bind('sfLogon', () => fwSet({ action: 'seclog', enable: $('#sfLogon').checked }));
+    bindClick('sfLogRefresh', async () => {
+      const pre = $('#sfLog'), btn = $('#sfLogRefresh');
+      btn.disabled = true; btn.textContent = '刷新中…';
+      try {
+        const { data } = await api('/api/secfw', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'seclog_refresh' }),
+        });
+        if (pre && data && data.secLog !== undefined) pre.textContent = data.secLog || '（暂无记录）';
+      } catch (e) { sfErr((e && e.message) || String(e)); }
+      btn.disabled = false; btn.textContent = '刷新记录';
+    });
+  }
+  if (note) {
+    note.classList.remove('hidden');
+    note.textContent = FW.dual
+      ? '级别说明——高：外部既不能访问局域网设备也不能访问路由器；中：仅允许 ping 设备；低：可访问局域网设备但路由器仍受保护。'
+      : '级别说明——高：外部访问限制最严；中：允许 ping 设备；低：局域网设备对外部开放，仅路由器受保护。';
+  }
+}
+
+function sfErr(msg) {
+  const err = $('#sfErr');
+  if (!err) return;
+  err.classList.remove('hidden');
+  err.textContent = msg;
+}
+
+async function fwSet(payload) {
+  try {
+    const { data } = await api('/api/secfw', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    FW = data || FW;
+    renderFw();
+    toast('已保存');
+  } catch (e) {
+    sfErr('保存失败：' + ((e && e.message) || e));
+    loadFw(true);                    // 失败回读真实状态，不让界面停在假状态上
   }
 }
 
@@ -4989,6 +5140,7 @@ async function runSpeed() {
     await load();
     loadCompat();                     // 兼容性报告（后端已缓存则秒回）
     loadMesh();                       // Mesh 组网状态（网络页用，登录后先取一次缓存渲染）
+    loadFw();                         // 安全防护（防火墙/防攻击/安全日志）
     loadPortLive(); startPortLive();  // 冷启动默认页就是概览：load() 只刷 /api/all，
                                       // 不触发 go('home')，网口实况会一直卡在「读取中」
     startNetLive();                   // 同理会停在初始的「—」，这里开始 1 秒实时采样

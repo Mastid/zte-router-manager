@@ -168,6 +168,26 @@ RESOURCES = {
             {"family": FAMILY_VUE, "type": VUE, "tag": "vue_topo_data", "probe": "OBJ_"},
         ],
     },
+    # 安全防护：防火墙级别 / 防攻击保护（OBJ_FWLEVEL_ID）
+    "secfw": {
+        "label": "防火墙",
+        "cands": [
+            {"family": FAMILY_VUE, "type": VUE, "tag": "security_firewall_data",
+             "probe": "OBJ_FWLEVEL_ID"},
+            {"family": FAMILY_VUE, "type": VUE, "tag": "vue_security_firewall_data",
+             "probe": "OBJ_"},
+        ],
+    },
+    # 安全防护：安全日志（破解/攻击记录，OBJ_LOG_ID）
+    "seclog": {
+        "label": "安全日志",
+        "cands": [
+            {"family": FAMILY_VUE, "type": VUE, "tag": "seclogmgr_data",
+             "probe": "OBJ_LOG_ID"},
+            {"family": FAMILY_VUE, "type": VUE, "tag": "vue_seclog_data",
+             "probe": "OBJ_"},
+        ],
+    },
 }
 
 # ---------------------------------------------------------------- 机型画像

@@ -437,6 +437,8 @@ public class MainActivity extends Activity {
             if ("model".equals(method)) return client.modelJson();
             if ("compat".equals(method)) return client.compatJson();
             if ("mesh".equals(method)) return client.meshJson();
+            if ("secFw".equals(method)) return client.secFwJson();
+            if ("secFwSet".equals(method)) return client.secFwSetJson(arg);
             if ("compatRedetect".equals(method)) return client.compatRedetect();
             if ("dualwanset".equals(method)) return client.dualwanSetJson(arg);
             if ("adminpwd".equals(method)) return client.adminPwdJson(arg);

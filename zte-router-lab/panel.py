@@ -528,6 +528,140 @@ def api_mesh():
     }
 
 
+# ---------------------------------------------------------------- 安全防护（防火墙 / 防攻击 / 安全日志）
+
+# 固件 UI 级别值 ↔ 接口值（chunk4 逆向：3=高 6=中 9=低，线上值 High/Middle/Low）
+_FW_LEVELS = ("High", "Middle", "Low")
+_FW_LEVEL_CN = {"High": "高", "Middle": "中", "Low": "低"}
+
+
+def _fw_level_of(raw):
+    v = (raw or "").strip()
+    return v if v in _FW_LEVELS else "High"
+
+
+def _sec_fw_read():
+    """读 security_firewall_data → OBJ_FWLEVEL_ID[0]"""
+    d = vget("secfw")
+    inst = (d.get("OBJ_FWLEVEL_ID") or [{}])[0]
+    return inst or {}
+
+
+def _sec_fw_write(form):
+    txt = ax("/?_type=vueData&_tag=security_firewall_data", form, timeout=12)
+    up = (txt or "").upper()
+    if "SUCC" not in up and "OK" not in up and not _stale(txt):
+        # 固件应答带 IF_ERRORSTR=SUCC；失败时抛错让前端显示
+        m = re.search(r"IF_ERRORSTR>\s*([^<\s]+)", txt or "")
+        err = m.group(1) if m else (txt or "")[:120]
+        if err.upper() != "SUCC":
+            raise ValueError("路由器拒绝了防火墙设置（%s）" % err)
+    return txt
+
+
+def api_secfw():
+    """安全防护现状：IPv4/IPv6 防火墙级别、防攻击保护、安全日志（破解/攻击记录）"""
+    fw = _sec_fw_read()
+    dual = "Ipv4Enable" in fw          # 新固件有 IPv4/IPv6 双开关；旧固件只有 Level
+    out = {
+        "ok": True,
+        "supported": bool(fw),
+        "dual": dual,
+        "antiAttack": (fw.get("AntiAttack") or "").strip() == "1",
+    }
+    if dual:
+        out["ipv4Enable"] = (fw.get("Ipv4Enable") or "").strip() == "1"
+        out["ipv6Enable"] = (fw.get("Ipv6Enable") or "").strip() == "1"
+        out["ipv4Level"] = _fw_level_of(fw.get("Ipv4Level"))
+        out["ipv6Level"] = _fw_level_of(fw.get("Ipv6Level"))
+    else:
+        out["level"] = _fw_level_of(fw.get("Level"))
+    # 安全日志：开关 + 记录内容
+    try:
+        log = vget("seclog")
+        inst = (log.get("OBJ_LOG_ID") or [{}])[0]
+        out["secLogEnable"] = (inst.get("SecLogEnable") or "").strip() == "1"
+        out["secLog"] = (inst.get("logStr") or "").replace("\r", "").strip()
+    except Exception as e:
+        _slog("读安全日志失败 %s" % e)
+        out["secLogEnable"] = None
+        out["secLog"] = ""
+    out["secLogSupported"] = out["secLogEnable"] is not None
+    return out
+
+
+def api_secfw_set(body=None):
+    """安全防护写入。body: {action: firewall|antiattack|seclog|seclog_refresh, ...}
+
+    写防火墙走回填式：整表读出 → 只改请求的字段 → 原样提交，防止把另一半配置打掉。
+    """
+    body = body or {}
+    act = (body.get("action") or "").strip()
+
+    if act == "firewall":
+        fw = _sec_fw_read()
+        if not fw:
+            raise ValueError("这台固件没有防火墙配置接口")
+        dual = "Ipv4Enable" in fw
+        form = {
+            "IF_ACTION": "Apply",
+            "_InstID": "IGD",
+            "Level": "",
+            "AntiAttack": "1" if (fw.get("AntiAttack") or "").strip() == "1" else "0",
+            "Btn_cancel_FirewallConf": "",
+            "Btn_apply_FirewallConf": "",
+        }
+        if dual:
+            # 开关与级别分别回填：前端只传想改的项，其余保持现值
+            form["Ipv4Enable"] = "1" if body.get("ipv4Enable",
+                    (fw.get("Ipv4Enable") or "").strip() == "1") else "0"
+            form["Ipv6Enable"] = "1" if body.get("ipv6Enable",
+                    (fw.get("Ipv6Enable") or "").strip() == "1") else "0"
+            form["Ipv4Level"] = _fw_level_of(body.get("ipv4Level") or fw.get("Ipv4Level"))
+            form["Ipv6Level"] = _fw_level_of(body.get("ipv6Level") or fw.get("Ipv6Level"))
+            # 固件规则：关掉的侧不提交级别
+            if form["Ipv4Enable"] != "1":
+                form["Ipv4Level"] = ""
+            if form["Ipv6Enable"] != "1":
+                form["Ipv6Level"] = ""
+        else:
+            form["Level"] = _fw_level_of(body.get("level") or fw.get("Level"))
+        _sec_fw_write(form)
+        return api_secfw()
+
+    if act == "antiattack":
+        fw = _sec_fw_read()
+        if not fw:
+            raise ValueError("这台固件没有防攻击保护接口")
+        form = {
+            "IF_ACTION": "Apply",
+            "_InstID": "IGD",
+            "Level": _fw_level_of(fw.get("Level")) if "Ipv4Enable" not in fw else "",
+            "AntiAttack": "1" if body.get("enable") else "0",
+            "Btn_cancel_FirewallConf": "",
+            "Btn_apply_FirewallConf": "",
+        }
+        _sec_fw_write(form)
+        return api_secfw()
+
+    if act == "seclog":
+        form = {
+            "IF_ACTION": "Apply",
+            "SecLogEnable": "1" if body.get("enable") else "0",
+            "TOKEN_SECLOG_DOWNLOAD": S.get("token") or "",
+        }
+        ax("/?_type=vueData&_tag=seclogmgr_data", form, timeout=12)
+        return api_secfw()
+
+    if act == "seclog_refresh":
+        txt = ax("/?_type=vueData&_tag=seclogmgr_data",
+                 {"IF_ACTION": "Refresh"}, timeout=15)
+        inst = (groups(txt).get("OBJ_LOG_ID") or [{}])[0]
+        return {"ok": True, "secLog": (inst.get("logStr") or "").strip()}
+
+    raise ValueError("未知的安全防护操作：%s" % (act or "空"))
+
+
 def feel_token():
     """取一个新的一次性令牌（用只读业务接口，不能用登录接口，否则会顶掉当前会话）
 
@@ -941,7 +1075,7 @@ def band_of(inst):
 
 
 # ---------- 设备信息（面板自身运行环境，手机端由原生层提供） ----------
-APP_VER = "2.10.0"
+APP_VER = "2.11.0"
 START_TS = time.time()
 
 
@@ -3362,6 +3496,12 @@ class H(BaseHTTPRequestHandler):
             except RuntimeError as e:
                 self._json({"ok": False, "error": str(e)})
             return
+        if p == "/api/secfw":
+            try:
+                self._guard(api_secfw)
+            except RuntimeError as e:
+                self._json({"ok": False, "error": str(e)})
+            return
         if p == "/api/dualwan":
             self._guard(api_dualwan)
             return
@@ -3390,6 +3530,12 @@ class H(BaseHTTPRequestHandler):
             return
         if p == "/api/compat":
             self._guard(lambda: api_compat_redetect())
+            return
+        if p == "/api/secfw":
+            try:
+                self._guard(lambda: api_secfw_set(data))
+            except RuntimeError as e:
+                self._json({"ok": False, "error": str(e)})
             return
         if p == "/api/dualwan":
             self._guard(lambda: api_dualwan_save(data))

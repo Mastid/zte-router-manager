@@ -3558,6 +3558,172 @@ public class ZteClient {
         try { return m.find() ? Integer.parseInt(m.group(1)) : dflt; } catch (Exception e) { return dflt; }
     }
 
+    private static boolean argBool(String arg, String key, boolean dflt) {
+        if (arg == null) return dflt;
+        Matcher m = Pattern.compile("\"" + key + "\"\\s*:\\s*(true|false)").matcher(arg);
+        return m.find() ? Boolean.parseBoolean(m.group(1)) : dflt;
+    }
+
+    // ================= 安全防护（防火墙 / 防攻击 / 安全日志） =================
+
+    private static final String[] FW_LEVELS = {"High", "Middle", "Low"};
+
+    private static String fwLevelOf(String raw) {
+        String v = nz(raw).trim();
+        for (String l : FW_LEVELS) if (l.equalsIgnoreCase(v)) return l;
+        return "High";
+    }
+
+    /** 读防火墙表（security_firewall_data → OBJ_FWLEVEL_ID[0]），失败返回空表 */
+    private Map<String, String> secFwRead() throws IOException, NotLogged {
+        Map<String, List<Map<String, String>>> g = fetch(
+                "/?_type=vueData&_tag=security_firewall_data&_=" + System.currentTimeMillis());
+        List<Map<String, String>> lst = g.get("OBJ_FWLEVEL_ID");
+        return (lst != null && !lst.isEmpty()) ? lst.get(0)
+                : new LinkedHashMap<String, String>();
+    }
+
+    private void secFwWrite(LinkedHashMap<String, String> form)
+            throws IOException, NotLogged {
+        String body = ax("/?_type=vueData&_tag=security_firewall_data", form, 12);
+        String err = nz(xmlField(body, "IF_ERRORSTR")).trim();
+        if (err.length() > 0 && !"SUCC".equalsIgnoreCase(err)) {
+            throw new IOException("路由器拒绝了防火墙设置（" + err + "）");
+        }
+    }
+
+    /** 安全防护现状：IPv4/IPv6 防火墙级别、防攻击保护、安全日志（破解/攻击记录） */
+    public synchronized String secFwJson() {
+        try {
+            return secFwJsonInner();
+        } catch (NotLogged e) {
+            return "{\"ok\":false,\"error\":\"NOT_LOGGED\",\"detail\":" + jstr(error) + "}";
+        } catch (Exception e) {
+            return "{\"ok\":false,\"error\":" + jstr(msg(e)) + "}";
+        }
+    }
+
+    private synchronized String secFwJsonInner() throws IOException, NotLogged {
+        if (!logged) return "{\"ok\":false,\"error\":\"未登录\"}";
+        Map<String, String> fw = secFwRead();
+        boolean dual = fw.containsKey("Ipv4Enable");
+        StringBuilder sb = new StringBuilder(512);
+        sb.append("{\"ok\":true,\"supported\":").append(!fw.isEmpty())
+          .append(",\"dual\":").append(dual)
+          .append(",\"antiAttack\":").append("1".equals(nz(fw.get("AntiAttack")).trim()));
+        if (dual) {
+            sb.append(",\"ipv4Enable\":").append("1".equals(nz(fw.get("Ipv4Enable")).trim()))
+              .append(",\"ipv6Enable\":").append("1".equals(nz(fw.get("Ipv6Enable")).trim()))
+              .append(",\"ipv4Level\":").append(jstr(fwLevelOf(fw.get("Ipv4Level"))))
+              .append(",\"ipv6Level\":").append(jstr(fwLevelOf(fw.get("Ipv6Level"))));
+        } else {
+            sb.append(",\"level\":").append(jstr(fwLevelOf(fw.get("Level"))));
+        }
+        // 安全日志
+        boolean logSupported = false;
+        boolean logOn = false;
+        String logStr = "";
+        try {
+            Map<String, List<Map<String, String>>> lg = fetch(
+                    "/?_type=vueData&_tag=seclogmgr_data&_=" + System.currentTimeMillis());
+            List<Map<String, String>> lst = lg.get("OBJ_LOG_ID");
+            if (lst != null && !lst.isEmpty()) {
+                Map<String, String> inst = lst.get(0);
+                logSupported = true;
+                logOn = "1".equals(nz(inst.get("SecLogEnable")).trim());
+                logStr = nz(inst.get("logStr"));
+            }
+        } catch (Exception e) {
+            trace("读安全日志失败 " + msg(e));
+        }
+        sb.append(",\"secLogSupported\":").append(logSupported)
+          .append(",\"secLogEnable\":").append(logOn)
+          .append(",\"secLog\":").append(jstr(logStr.replace("\r", "")))
+          .append("}");
+        return sb.toString();
+    }
+
+    /** 安全防护写入：{action: firewall|antiattack|seclog|seclog_refresh, ...}，回填式 */
+    public synchronized String secFwSetJson(String arg) {
+        try {
+            return secFwSetInner(arg);
+        } catch (NotLogged e) {
+            return "{\"ok\":false,\"error\":\"NOT_LOGGED\",\"detail\":" + jstr(error) + "}";
+        } catch (Exception e) {
+            return "{\"ok\":false,\"error\":" + jstr(msg(e)) + "}";
+        }
+    }
+
+    private synchronized String secFwSetInner(String arg)
+            throws IOException, NotLogged {
+        if (!logged) return "{\"ok\":false,\"error\":\"未登录\"}";
+        String act = argStr(arg, "action");
+        if (act.length() == 0) {
+            return "{\"ok\":false,\"error\":\"缺少 action（firewall/antiattack/seclog/seclog_refresh）\"}";
+        }
+
+        if ("firewall".equals(act) || "antiattack".equals(act)) {
+            Map<String, String> fw = secFwRead();
+            if (fw.isEmpty()) {
+                return "{\"ok\":false,\"error\":\"这台固件没有防火墙配置接口\"}";
+            }
+            boolean dual = fw.containsKey("Ipv4Enable");
+            LinkedHashMap<String, String> form = new LinkedHashMap<String, String>();
+            form.put("IF_ACTION", "Apply");
+            form.put("_InstID", "IGD");
+            form.put("Level", dual ? "" : fwLevelOf(fw.get("Level")));
+            // 防攻击：action=antiattack 用新值，action=firewall 保持现值（回填式）
+            form.put("AntiAttack", "antiattack".equals(act)
+                    ? (argBool(arg, "enable", false) ? "1" : "0")
+                    : ("1".equals(nz(fw.get("AntiAttack")).trim()) ? "1" : "0"));
+            form.put("Btn_cancel_FirewallConf", "");
+            form.put("Btn_apply_FirewallConf", "");
+            if (dual) {
+                // 回填式：只改请求的字段，其余保持现值；固件规则是关掉的侧不提交级别
+                boolean v4on = ("firewall".equals(act) && arg.contains("\"ipv4Enable\""))
+                        ? argBool(arg, "ipv4Enable", false)
+                        : "1".equals(nz(fw.get("Ipv4Enable")).trim());
+                boolean v6on = ("firewall".equals(act) && arg.contains("\"ipv6Enable\""))
+                        ? argBool(arg, "ipv6Enable", false)
+                        : "1".equals(nz(fw.get("Ipv6Enable")).trim());
+                String v4lv = argStr(arg, "ipv4Level");
+                String v6lv = argStr(arg, "ipv6Level");
+                form.put("Ipv4Enable", v4on ? "1" : "0");
+                form.put("Ipv6Enable", v6on ? "1" : "0");
+                form.put("Ipv4Level", (v4on && v4lv.length() > 0) ? fwLevelOf(v4lv)
+                        : (v4on ? fwLevelOf(fw.get("Ipv4Level")) : ""));
+                form.put("Ipv6Level", (v6on && v6lv.length() > 0) ? fwLevelOf(v6lv)
+                        : (v6on ? fwLevelOf(fw.get("Ipv6Level")) : ""));
+            } else if ("firewall".equals(act)) {
+                String lv = argStr(arg, "level");
+                if (lv.length() > 0) form.put("Level", fwLevelOf(lv));
+            }
+            secFwWrite(form);
+            return secFwJsonInner();
+        }
+
+        if ("seclog".equals(act)) {
+            LinkedHashMap<String, String> form = new LinkedHashMap<String, String>();
+            form.put("IF_ACTION", "Apply");
+            form.put("SecLogEnable", argBool(arg, "enable", false) ? "1" : "0");
+            form.put("TOKEN_SECLOG_DOWNLOAD", nz(token));
+            ax("/?_type=vueData&_tag=seclogmgr_data", form, 12);
+            return secFwJsonInner();
+        }
+
+        if ("seclog_refresh".equals(act)) {
+            String body = ax("/?_type=vueData&_tag=seclogmgr_data",
+                    new LinkedHashMap<String, String>() {{ put("IF_ACTION", "Refresh"); }}, 15);
+            Map<String, List<Map<String, String>>> g = groups(body);
+            List<Map<String, String>> lst = g.get("OBJ_LOG_ID");
+            String logStr = (lst != null && !lst.isEmpty())
+                    ? nz(lst.get(0).get("logStr")).replace("\r", "") : "";
+            return "{\"ok\":true,\"secLog\":" + jstr(logStr) + "}";
+        }
+
+        return "{\"ok\":false,\"error\":\"未知的安全防护操作：" + act + "\"}";
+    }
+
     /** 网口实况：插线 / 速率 / 实时流量 / 接入设备（含离线） */
     public synchronized String portsLiveJson() {
         List<Map<String, String>> ports;
